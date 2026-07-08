@@ -298,18 +298,14 @@ class CIRCA(L.LightningModule):
         
         cell_hat = x[:,0,:].clone()
 
-        aug_type = torch.multinomial(
-            torch.tensor([1, 1, 1]) / 3,
-            2, replacement=True
-        )
+        aug_probs = torch.ones(3, device=x.device) / 3
+        aug_type = torch.multinomial(aug_probs, 2, replacement=True)
         
         t = aug_type[0]
 
         if self.n_panels > 1:
-            panel_types = torch.multinomial(
-                torch.ones(self.n_panels) / self.n_panels,
-                2, replacement=False
-            )
+            panel_probs = torch.ones(self.n_panels, device=x.device) / self.n_panels
+            panel_types = torch.multinomial(panel_probs, 2, replacement=False)
 
         ## sample drop_rate from beta distribution with expected value of mask_prop
         drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
@@ -367,19 +363,14 @@ class CIRCA(L.LightningModule):
         
         cell_hat = x[:,0,:].clone() # + 1e-4
         
-        
-        aug_type = torch.multinomial(
-            torch.tensor([1, 1, 1]) / 3,
-            2, replacement=True
-        )
+        aug_probs = torch.ones(3, device=x.device) / 3
+        aug_type = torch.multinomial(aug_probs, 2, replacement=True)
         
         t = aug_type[0]
 
         if self.n_panels > 1:
-            panel_types = torch.multinomial(
-                torch.ones(self.n_panels) / self.n_panels,
-                2, replacement=False
-            )
+            panel_probs = torch.ones(self.n_panels, device=x.device) / self.n_panels
+            panel_types = torch.multinomial(panel_probs, 2, replacement=False)
 
         ## sample drop_rate from beta distribution with expected value of mask_prop
         drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
@@ -479,7 +470,22 @@ class CIRCA(L.LightningModule):
         return torch.cat(padded_latents, dim=1), raw_latents
 
     def forward(self, x, slide_id, obs_feature_groups=None):
+        """
+        Args:
+            x: Tensor of shape [B, 2 + n_neighbors, input_dim].
+                Channel 0 is the center cell.
+                Channel 1 is the augmented center-cell view.
+                Channels 2: are spatial neighbors.
+        """
+        
         B, G, C = x.size()
+
+        expected_channels = self.n_neighbors + 2
+        if G != expected_channels:
+            raise ValueError(
+                f"Expected x to have {expected_channels} channels "
+                f"[cell, cell_hat, {self.n_neighbors} neighbors], got {G}."
+            )
 
         hz, hz_state, batch_logits = self.encode(x)
         extra_group_latents, _ = self._encode_extra_groups(obs_feature_groups)

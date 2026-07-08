@@ -10,15 +10,15 @@ from torch.utils.data import DataLoader
 import lightning as L
 
 from circa.data.dataset import SpatialNeighborhoodDataset, SimulatedDataset
-from .circa.datasampler import InterleavedSlideBatchSampler, SlideBlockBatchSampler, build_slide_to_dsidx
-
+from circa.data.datasampler import InterleavedSlideBatchSampler, SlideBlockBatchSampler, build_slide_to_dsidx
+from circa.utils._torch import matrix_rows_to_numpy
 
 @dataclass
 class LoaderConfig:
     batch_size: int = 256
     block_size: int = 16
     num_workers: int = 0
-    pin_memory: bool = True
+    pin_memory: bool = False
     drop_last: bool = True
     persistent_workers: bool = True 
 
@@ -229,19 +229,27 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         out: Dict[str, Any] = {}
         out["adata_idx"] = torch.tensor([b["adata_idx"] for b in batch], dtype=torch.long)
 
-        neigh_idx = torch.full((B, k), -1, dtype=torch.long)
-        neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
+        out["neighbor_idx"] = torch.stack(
+            [b["neighbor_idx"] for b in batch], dim=0
+        )
 
-        for bi, b in enumerate(batch):
-            ni = b["neighbor_idx"]
-            nd = b["neighbor_dist"]
-            m = min(k, ni.numel())
-            if m > 0:
-                neigh_idx[bi, :m] = ni[:m]
-                neigh_dist[bi, :m] = nd[:m]
+        out["neighbor_dist"] = torch.stack(
+            [b["neighbor_dist"] for b in batch], dim=0
+        )
 
-        out["neighbor_idx"] = neigh_idx
-        out["neighbor_dist"] = neigh_dist
+        # neigh_idx = torch.full((B, k), -1, dtype=torch.long)
+        # neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
+
+        # for bi, b in enumerate(batch):
+        #     ni = b["neighbor_idx"]
+        #     nd = b["neighbor_dist"]
+        #     m = min(k, ni.numel())
+        #     if m > 0:
+        #         neigh_idx[bi, :m] = ni[:m]
+        #         neigh_dist[bi, :m] = nd[:m]
+
+        # out["neighbor_idx"] = neigh_idx
+        # out["neighbor_dist"] = neigh_dist
 
         for key in self.obs_keys:
             out[key] = torch.tensor([b[key] for b in batch])
@@ -251,7 +259,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
 
         if self.return_expression:
             all_idx = np.concatenate([out["adata_idx"][:, None], out["neighbor_idx"]], axis=1)
-            expr = X[all_idx.reshape(-1)].toarray().astype(np.float32)
+            expr = matrix_rows_to_numpy(X, all_idx.reshape(-1)).astype(np.float32)
             expr = torch.from_numpy(expr.reshape(B, 1 + k, G))
 
             cell = expr[:, 0]
@@ -342,7 +350,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
                 batch_sampler=batch_sampler,
                 num_workers=loader_cfg.num_workers,
                 pin_memory=loader_cfg.pin_memory,
-                persistent_workers=loader_cfg.persistent_workers,
+                persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
                 collate_fn=self._collate_fn
             )
 
@@ -353,7 +361,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
             shuffle=training,
             num_workers=loader_cfg.num_workers,
             pin_memory=loader_cfg.pin_memory,
-            persistent_workers=loader_cfg.persistent_workers,
+            persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
             drop_last=loader_cfg.drop_last,
             collate_fn=self._collate_fn
         )

@@ -5,8 +5,20 @@ import numpy as np
 import torch
 import importlib
 import scipy
+import scipy.sparse as sp
 import math
 from anndata import AnnData
+
+def as_dense_array(x):
+    if sp.issparse(x):
+        return x.toarray()
+    return np.asarray(x)
+
+def matrix_rows_to_numpy(X, idx):
+    rows = X[idx]
+    if sp.issparse(rows):
+        return rows.toarray()
+    return np.asarray(rows)
 
 def build_cell_cell_communication_masks(genes, lr_table):
     n_genes = len(genes)

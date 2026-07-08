@@ -11,6 +11,7 @@ import scipy.stats as st
 import torch
 from torch.utils.data import Dataset
 from circa.data.generate_dataset import generate_dataset
+from circa.utils._torch import as_dense_array
 from sklearn.decomposition import NMF, PCA
 from sklearn.neighbors import BallTree
 
@@ -403,18 +404,6 @@ class SpatialNeighborhoodDataset(Dataset):
 
         return nbr_idx, nbr_dist
 
-    @staticmethod
-    def _row_to_dense(X, i: int) -> np.ndarray:
-        if sp.issparse(X):
-            return X[i].toarray().ravel().astype(np.float32, copy=False)
-        return np.asarray(X[i]).ravel().astype(np.float32, copy=False)
-
-    @staticmethod
-    def _rows_to_dense(X, idxs: np.ndarray) -> np.ndarray:
-        if sp.issparse(X):
-            return X[idxs].toarray().astype(np.float32, copy=False)
-        return np.asarray(X[idxs]).astype(np.float32, copy=False)
-
     def _sample_k_from_topM(self, idx_row: np.ndarray, dist_row: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         idx_row/dist_row: length M, sorted, padded (-1/+inf)
@@ -475,19 +464,6 @@ class SpatialNeighborhoodDataset(Dataset):
 
         val = self._obs[self.panel_key][i]
         out["panel"] = val.item() if isinstance(val, np.generic) else val
-
-        # if self.return_expression:
-        #     cell = self._row_to_dense(self._X, i)
-        #     neighbors = (
-        #         self._rows_to_dense(self._X, neigh_i)
-        #         if neigh_i.size > 0
-        #         else np.zeros((0, cell.shape[0]), dtype=np.float32)
-        #     )
-        #     out["cell"] = torch.from_numpy(cell).float()
-        #     out["neighbors"] = torch.from_numpy(neighbors).float()
-        #     if self.include_counts:
-        #         out["cell_counts"] = float(cell.sum(dtype=np.float64))
-        #         out["niche_counts"] = float(neighbors.sum(dtype=np.float64))
 
         if self._obs_feature_mats:
             obs_feature_groups: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -669,11 +645,16 @@ class SimulatedDataset(Dataset):
         # self.sim_nbrs_counts = np.random.poisson(np.median(sim_nbrs_total_counts) * self.sim_nbrs_counts / sim_nbrs_total_counts)
         self.sim_nbrs_counts = self.sim_nbrs_counts.reshape(self.sim_config.num_data, self.sim_config.k, -1)
 
+        self.num_data = self.sim_config.num_data
+
         if split == "val":
-            self.sim_config.num_data = int(self.val_fraction * self.sim_config.num_data / (1 - self.val_fraction))
-            self.sim_counts = self.sim_counts[:self.sim_config.num_data]
-            self.sim_nbrs_counts = self.sim_nbrs_counts[:self.sim_config.num_data]
-            self.indices = np.arange(self.sim_config.num_data, dtype=int)
+            self.num_data = int(
+                self.val_fraction * self.sim_config.num_data / (1 - self.val_fraction)
+            )
+            self.sim_counts = self.sim_counts[:self.num_data]
+            self.sim_nbrs_counts = self.sim_nbrs_counts[:self.num_data]
+        
+        self.indices = np.arange(self.num_data, dtype=int)
         
 
     def __len__(self) -> int:
@@ -757,7 +738,7 @@ class SimulatedDataset(Dataset):
             max_iter=1000,
         )
     
-        W_nbrs = self.nbrhood_nmf.fit_transform(np.asarray(X.todense())[self.nbr_idx].reshape(self.n_samples,-1))      # neighborhoods x factors
+        W_nbrs = self.nbrhood_nmf.fit_transform(as_dense_array(X)[self.nbr_idx].reshape(self.n_samples,-1))      # neighborhoods x factors
         H_nbrs = self.nbrhood_nmf.components_           # factors x genes_used
     
         # Store cell loadings
