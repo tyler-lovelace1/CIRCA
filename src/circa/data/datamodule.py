@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 import lightning as L
 
 from circa.data.dataset import SpatialNeighborhoodDataset, SimulatedDataset
-from circa.data.datasampler import InterleavedSlideBatchSampler, SlideBlockBatchSampler, build_slide_to_dsidx
+from circa.data.sampler import InterleavedSlideBatchSampler, SlideBlockBatchSampler, build_slide_to_dsidx
 from circa.utils._torch import matrix_rows_to_numpy
 
 @dataclass
