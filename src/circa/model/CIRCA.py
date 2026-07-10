@@ -54,6 +54,7 @@ class CIRCA(L.LightningModule):
         self.slide_key = hparams['slide_key']
         self.phi_share = bool(hparams.get("phi_share", False))
         self.pool_neighbors = bool(hparams.get("pool_neighbors", False))
+        self.log_sklearn_metrics = bool(hparams.get("log_sklearn_metrics", False))
         
         self.warmup_steps = int(hparams.get("warmup_steps", 1000))
 
@@ -267,11 +268,8 @@ class CIRCA(L.LightningModule):
             return compute_lambda(self.global_step, self.warmup_steps, self.trainer.estimated_stepping_batches)
         return 1.0
 
-    def encode(self, x):
-        B = x.size(0)
-        device = x.device
-    
-        hz = self.backbone(x)
+    def _encode_projected(self, hz):
+        B = hz.size(0)
 
         if self.pool_neighbors:
             hz_gcarl = torch.cat([
@@ -283,18 +281,160 @@ class CIRCA(L.LightningModule):
                 self.cell_net(hz[:, 0, :]).unsqueeze(1),
                 self.niche_net(hz[:, 2:, :].reshape((B, self.n_neighbors * self.hz_dim))).unsqueeze(1)
             ], dim=1)
-    
+
         hz_state = F.normalize(self.state_net(hz[:, :2, :]), dim=2)
-    
-        # ----- optional adversarial logits -----
+
         batch_logits = None
         if self.use_adv:
             grl_lam = self._compute_grl_lambda()
             batch_logits = [self.panel_discriminator(self.panel_grl(hz[:,0,:], grl_lam))]
             if self.slide_discriminator is not None:
                 batch_logits.append(self.slide_discriminator(self.slide_grl(hz[:,0,:], grl_lam)))
-    
+
         return hz_gcarl, hz_state, batch_logits
+
+    def encode(self, x):
+        hz = self.backbone(x)
+        return self._encode_projected(hz)
+
+    def _sparse_log1p(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.coalesce()
+        return torch.sparse_coo_tensor(
+            x.indices(),
+            torch.log1p(x.values()),
+            x.shape,
+            device=x.device,
+            dtype=x.dtype,
+        ).coalesce()
+
+    def _project_sparse_expression(self, x: torch.Tensor, batch_size: int, n_channels: int) -> torch.Tensor:
+        x = x.coalesce()
+        modules = list(self.backbone.net._modules.items())
+        input_layer = modules[0][1]
+        if not isinstance(input_layer, nn.Linear):
+            raise TypeError("Sparse expression path expects backbone.net's first module to be nn.Linear.")
+
+        h = torch.sparse.mm(x, input_layer.weight.t())
+        if input_layer.bias is not None:
+            h = h + input_layer.bias
+
+        for _, module in modules[1:]:
+            h = module(h)
+
+        return h.reshape(batch_size, n_channels, self.hz_dim)
+
+    def _sparse_rows(self, x: torch.Tensor, rows: torch.Tensor, n_rows: int) -> torch.Tensor:
+        x = x.coalesce()
+        idx = x.indices()
+        vals = x.values()
+        row_map = torch.full((x.size(0),), -1, device=x.device, dtype=torch.long)
+        row_map[rows] = torch.arange(n_rows, device=x.device)
+        new_rows = row_map[idx[0]]
+        keep = new_rows >= 0
+        new_idx = torch.stack([new_rows[keep], idx[1, keep]], dim=0)
+        return torch.sparse_coo_tensor(new_idx, vals[keep], (n_rows, x.size(1)), device=x.device).coalesce()
+
+    def _scale_sparse_rows(self, x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        x = x.coalesce()
+        idx = x.indices()
+        vals = x.values() * scales[idx[0]].to(x.values().dtype)
+        return torch.sparse_coo_tensor(idx, vals, x.shape, device=x.device, dtype=x.dtype).coalesce()
+
+    def _mask_sparse_values(self, x: torch.Tensor, mask_prop: float, panel_type=None) -> torch.Tensor:
+        x = x.coalesce()
+        idx = x.indices()
+        vals = x.values()
+        keep = torch.rand(vals.shape, device=x.device) > mask_prop
+        if panel_type is not None:
+            keep = keep & self.panel_mask[panel_type, idx[1]].to(x.device)
+        return torch.sparse_coo_tensor(idx[:, keep], vals[keep], x.shape, device=x.device, dtype=x.dtype).coalesce()
+
+    def sparse_augment(self, x: torch.Tensor, batch_size: int, obs_feature_groups=None, validation: bool = False):
+        K = self.n_neighbors + 1
+        C = x.size(1)
+        device = x.device
+
+        aug_probs = torch.ones(3, device=device) / 3
+        aug_type = torch.multinomial(aug_probs, 2, replacement=True)
+        t = aug_type[0]
+
+        panel_types = None
+        if self.n_panels > 1:
+            panel_probs = torch.ones(self.n_panels, device=device) / self.n_panels
+            panel_types = torch.multinomial(panel_probs, 2, replacement=False)
+
+        drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
+
+        rows = torch.arange(batch_size * K, device=device)
+        channel = rows.remainder(K)
+        cell_rows = rows[channel == 0]
+
+        x = x.coalesce()
+        totals = torch.sparse.sum(x, dim=1).to_dense().clamp_min(1)
+
+        if validation:
+            shuffled = totals.clone()
+            shuffled[cell_rows] = totals[cell_rows[torch.randperm(batch_size, device=device)]]
+            cell_hat = self._sparse_rows(x, cell_rows, batch_size)
+            cell_scales = shuffled[cell_rows] / totals[cell_rows]
+            cell_hat = self._scale_sparse_rows(cell_hat, cell_scales)
+        else:
+            shuffled = totals.clone()
+            shuffled[cell_rows] = totals[cell_rows[torch.randperm(batch_size, device=device)]]
+            if K > 1:
+                batch_perm = torch.randperm(batch_size, device=device)
+                channel_perm = torch.randperm(K - 1, device=device) + 1
+                for src_c, dst_c in enumerate(channel_perm, start=1):
+                    dst_rows = torch.arange(batch_size, device=device) * K + dst_c
+                    src_rows = batch_perm * K + src_c
+                    shuffled[dst_rows] = totals[src_rows]
+            x = self._scale_sparse_rows(x, shuffled / totals)
+            cell_hat = self._sparse_rows(x, cell_rows, batch_size)
+
+        if t == 1:
+            mask_prop = drop_rate / 2
+        elif t == 2:
+            mask_prop = 0
+        else:
+            mask_prop = drop_rate
+
+        if t != 2:
+            x_panel = panel_types[0] if panel_types is not None else None
+            cell_panel = panel_types[1] if panel_types is not None else None
+            if not validation:
+                x = self._mask_sparse_values(x, mask_prop, panel_type=x_panel)
+            cell_hat = self._mask_sparse_values(cell_hat, mask_prop, panel_type=cell_panel)
+
+        if t == 1:
+            lam = 1 - drop_rate / 2
+        elif t == 2:
+            lam = 1 - drop_rate
+        else:
+            lam = 1
+
+        if t != 0:
+            x = x.coalesce()
+            cell_hat = cell_hat.coalesce()
+            if not validation:
+                x = torch.sparse_coo_tensor(x.indices(), torch.poisson(lam * x.values()), x.shape, device=device, dtype=x.dtype).coalesce()
+            cell_hat = torch.sparse_coo_tensor(cell_hat.indices(), torch.poisson(lam * cell_hat.values()), cell_hat.shape, device=device, dtype=cell_hat.dtype).coalesce()
+
+        x = x.coalesce()
+        cell_hat = cell_hat.coalesce()
+        idx = x.indices()
+        vals = x.values()
+        out_rows = (idx[0] // K) * (K + 1) + idx[0].remainder(K)
+        cell_hat_idx = cell_hat.indices()
+        cell_hat_rows = cell_hat_idx[0] * (K + 1) + 1
+        out_idx = torch.cat([
+            torch.stack([out_rows, idx[1]], dim=0),
+            torch.stack([cell_hat_rows, cell_hat_idx[1]], dim=0),
+        ], dim=1)
+        out_vals = torch.cat([vals, cell_hat.values()], dim=0)
+        out = torch.sparse_coo_tensor(out_idx, out_vals, (batch_size * (K + 1), C), device=device, dtype=x.dtype).coalesce()
+
+        masked_obs_feature_groups = self._mask_obs_feature_groups(obs_feature_groups, mask_prop)
+        return out, masked_obs_feature_groups
 
     def _mask_obs_feature_groups(self, obs_feature_groups, mask_prop):
         if obs_feature_groups is None:
@@ -439,8 +579,12 @@ class CIRCA(L.LightningModule):
     def _unpack_batch(self, batch):
         # expected from your DataModule
         adata_idx = batch["adata_idx"].long()
-        cell = batch["cell"].float()          # [B, G]
-        neighbors = batch["neighbors"].float()  # [B, K, G]
+        if "x_sparse" in batch:
+            cell = None
+            neighbors = None
+        else:
+            cell = batch["cell"].float()          # [B, G]
+            neighbors = batch["neighbors"].float()  # [B, K, G]
         panel = batch["panel"].long()
         slide_id = batch["slide_id"].long()
         obs_feature_groups = batch.get("obs_feature_groups", None)
@@ -529,7 +673,7 @@ class CIRCA(L.LightningModule):
         return ((mean_loss + var_loss) * angle_hinge_loss).mean()
 
 
-    def forward(self, x, slide_id, obs_feature_groups=None):
+    def forward(self, x=None, slide_id=None, obs_feature_groups=None, projected_hz=None):
         """
         Args:
             x: Tensor of shape [B, 2 + n_neighbors, input_dim].
@@ -538,16 +682,26 @@ class CIRCA(L.LightningModule):
                 Channels 2: are spatial neighbors.
         """
         
-        B, G, C = x.size()
+        if projected_hz is None:
+            B, G, C = x.size()
 
-        expected_channels = self.n_neighbors + 2
-        if G != expected_channels:
-            raise ValueError(
-                f"Expected x to have {expected_channels} channels "
-                f"[cell, cell_hat, {self.n_neighbors} neighbors], got {G}."
-            )
+            expected_channels = self.n_neighbors + 2
+            if G != expected_channels:
+                raise ValueError(
+                    f"Expected x to have {expected_channels} channels "
+                    f"[cell, cell_hat, {self.n_neighbors} neighbors], got {G}."
+                )
 
-        hz, hz_state, batch_logits = self.encode(x)
+            hz, hz_state, batch_logits = self.encode(x)
+        else:
+            B, G, _ = projected_hz.size()
+            expected_channels = self.n_neighbors + 2
+            if G != expected_channels:
+                raise ValueError(
+                    f"Expected projected_hz to have {expected_channels} channels "
+                    f"[cell, cell_hat, {self.n_neighbors} neighbors], got {G}."
+                )
+            hz, hz_state, batch_logits = self._encode_projected(projected_hz)
         extra_group_latents, _ = self._encode_extra_groups(obs_feature_groups)
         if extra_group_latents is not None:
             hz = torch.cat([hz, extra_group_latents], dim=1)
@@ -714,16 +868,18 @@ class CIRCA(L.LightningModule):
     def training_step(self, train_batch, batch_idx):
         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = self._unpack_batch(train_batch)
 
-        assert neighbors.size(1) == self.n_neighbors
-        
-        B, num_genes = cell.size()
-
-        # -------- pack channels: [B, K, F] --------
-        x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
-
-        x_in, obs_feature_groups_aug = self.augment(x_orig, obs_feature_groups=obs_feature_groups)
-
-        logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
+        if "x_sparse" in train_batch:
+            x_sparse = train_batch["x_sparse"].float()
+            B = train_batch["x_sparse_shape"][0]
+            x_in, obs_feature_groups_aug = self.sparse_augment(x_sparse, B, obs_feature_groups=obs_feature_groups, validation=False)
+            projected_hz = self._project_sparse_expression(self._sparse_log1p(x_in), B, self.n_neighbors + 2)
+            logits, batch_logits, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
+        else:
+            assert neighbors.size(1) == self.n_neighbors
+            B, num_genes = cell.size()
+            x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
+            x_in, obs_feature_groups_aug = self.augment(x_orig, obs_feature_groups=obs_feature_groups)
+            logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
 
         # -------- labels & loss --------
 
@@ -771,9 +927,9 @@ class CIRCA(L.LightningModule):
 
         self.log('train_acc', torch.tensor([acc]), on_epoch=True)
 
-        self.log('train_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
-
-        self.log('train_mcc', torch.tensor([matthews_corrcoef(gcarl_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+        if self.log_sklearn_metrics:
+            self.log('train_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            self.log('train_mcc', torch.tensor([matthews_corrcoef(gcarl_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         self.log('train_state_loss', state_loss, on_epoch=True)
 
@@ -791,9 +947,9 @@ class CIRCA(L.LightningModule):
 
         self.log('train_state_acc', torch.tensor([acc]), on_epoch=True)
 
-        self.log('train_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-        self.log('train_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+        if self.log_sklearn_metrics:
+            self.log('train_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+            self.log('train_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         if self.use_adv:
             self.log('train_batch_loss', adv_loss, on_epoch=True)
@@ -803,9 +959,9 @@ class CIRCA(L.LightningModule):
         
             self.log('train_panel_acc', torch.tensor([acc]), on_epoch=True)
 
-            self.log('train_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-            self.log('train_panel_mcc', torch.tensor([matthews_corrcoef(panel_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            if self.log_sklearn_metrics:
+                self.log('train_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+                self.log('train_panel_mcc', torch.tensor([matthews_corrcoef(panel_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
             if self.slide_discriminator != None:
                 _, pred = torch.max(batch_logits[1], dim=1)
@@ -813,25 +969,27 @@ class CIRCA(L.LightningModule):
             
                 self.log('train_slide_acc', torch.tensor([acc]), on_epoch=True)
 
-                self.log('train_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-                self.log('train_slide_mcc', torch.tensor([matthews_corrcoef(slide_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+                if self.log_sklearn_metrics:
+                    self.log('train_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+                    self.log('train_slide_mcc', torch.tensor([matthews_corrcoef(slide_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         return loss
 
     def validation_step(self, valid_batch, batch_idx):
         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = self._unpack_batch(valid_batch)
 
-        assert neighbors.size(1) == self.n_neighbors
-        
-        B, num_genes = cell.size()
-
-        # -------- pack channels: [B, K, F] --------
-        x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
-
-        x_in, obs_feature_groups_aug = self.validation_augment(x_orig, obs_feature_groups=obs_feature_groups)
-
-        logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
+        if "x_sparse" in valid_batch:
+            x_sparse = valid_batch["x_sparse"].float()
+            B = valid_batch["x_sparse_shape"][0]
+            x_in, obs_feature_groups_aug = self.sparse_augment(x_sparse, B, obs_feature_groups=obs_feature_groups, validation=True)
+            projected_hz = self._project_sparse_expression(self._sparse_log1p(x_in), B, self.n_neighbors + 2)
+            logits, batch_logits, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
+        else:
+            assert neighbors.size(1) == self.n_neighbors
+            B, num_genes = cell.size()
+            x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
+            x_in, obs_feature_groups_aug = self.validation_augment(x_orig, obs_feature_groups=obs_feature_groups)
+            logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
 
         # -------- labels & loss --------
 
@@ -885,9 +1043,9 @@ class CIRCA(L.LightningModule):
 
         self.log('valid_acc', torch.tensor([acc]), on_epoch=True)
 
-        self.log('valid_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
-
-        self.log('valid_mcc', torch.tensor([matthews_corrcoef(gcarl_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+        if self.log_sklearn_metrics:
+            self.log('valid_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            self.log('valid_mcc', torch.tensor([matthews_corrcoef(gcarl_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         self.log('valid_symmetry', sym_loss, on_epoch=True)
 
@@ -905,9 +1063,9 @@ class CIRCA(L.LightningModule):
 
         self.log('valid_state_acc', torch.tensor([acc]), on_epoch=True)
 
-        self.log('valid_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-        self.log('valid_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+        if self.log_sklearn_metrics:
+            self.log('valid_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+            self.log('valid_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         # Extract and log the current learning rate
         opt = self.optimizers()
@@ -924,9 +1082,9 @@ class CIRCA(L.LightningModule):
         
             self.log('valid_panel_acc', torch.tensor([acc]), on_epoch=True)
 
-            self.log('valid_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-            self.log('valid_panel_mcc', torch.tensor([matthews_corrcoef(panel_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            if self.log_sklearn_metrics:
+                self.log('valid_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+                self.log('valid_panel_mcc', torch.tensor([matthews_corrcoef(panel_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
             if self.slide_discriminator != None:
                 _, pred = torch.max(batch_logits[1], dim=1)
@@ -934,9 +1092,9 @@ class CIRCA(L.LightningModule):
             
                 self.log('valid_slide_acc', torch.tensor([acc]), on_epoch=True)
 
-                self.log('valid_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-
-                self.log('valid_slide_mcc', torch.tensor([matthews_corrcoef(slide_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+                if self.log_sklearn_metrics:
+                    self.log('valid_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
+                    self.log('valid_slide_mcc', torch.tensor([matthews_corrcoef(slide_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
         return loss
 
