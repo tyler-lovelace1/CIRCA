@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 from torch.utils.data import DataLoader
 
@@ -47,6 +48,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         panel_key: str = "panel",
         x_layer: Optional[str] = None,
         return_expression: bool = True,
+        return_sparse_expression: bool = False,
         include_counts: bool = False,
         ensure_squidpy_neighbors: bool = True,
         squidpy_kwargs: Optional[Dict[str, Any]] = None,
@@ -78,6 +80,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         self.panel_key = panel_key
         self.x_layer = x_layer
         self.return_expression = return_expression
+        self.return_sparse_expression = bool(return_sparse_expression)
         self.include_counts = bool(include_counts)
 
         self.ensure_squidpy_neighbors = ensure_squidpy_neighbors
@@ -222,20 +225,27 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
           - obs_keys as lists (or you can tensorize categoricals separately if you want)
         """
         B = len(batch)
-        k = self.sampling_train.k
+        k = getattr(self, "_collate_k", batch[0]["neighbor_idx"].numel())
         G = self.adata.shape[1]
-        X = self.adata.X
+        X = getattr(getattr(self, "_collate_dataset", None), "_X", None)
+        if X is None:
+            X = self.adata.X
 
         out: Dict[str, Any] = {}
         out["adata_idx"] = torch.tensor([b["adata_idx"] for b in batch], dtype=torch.long)
 
-        out["neighbor_idx"] = torch.stack(
-            [b["neighbor_idx"] for b in batch], dim=0
-        )
+        neigh_idx = torch.full((B, k), -1, dtype=torch.long)
+        neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
+        for bi, b in enumerate(batch):
+            ni = b["neighbor_idx"]
+            nd = b["neighbor_dist"]
+            m = min(k, ni.numel())
+            if m > 0:
+                neigh_idx[bi, :m] = ni[:m]
+                neigh_dist[bi, :m] = nd[:m]
 
-        out["neighbor_dist"] = torch.stack(
-            [b["neighbor_dist"] for b in batch], dim=0
-        )
+        out["neighbor_idx"] = neigh_idx
+        out["neighbor_dist"] = neigh_dist
 
         # neigh_idx = torch.full((B, k), -1, dtype=torch.long)
         # neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
@@ -258,18 +268,33 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
             out[key] = torch.tensor([b[key] for b in batch])
 
         if self.return_expression:
-            all_idx = np.concatenate([out["adata_idx"][:, None], out["neighbor_idx"]], axis=1)
-            expr = matrix_rows_to_numpy(X, all_idx.reshape(-1)).astype(np.float32)
-            expr = torch.from_numpy(expr.reshape(B, 1 + k, G))
+            all_idx = torch.cat([out["adata_idx"][:, None], out["neighbor_idx"]], dim=1).numpy()
+            valid_expr = all_idx >= 0
+            safe_idx = all_idx.copy()
+            safe_idx[~valid_expr] = 0
 
-            cell = expr[:, 0]
-            neighbors = expr[:, 1:]
+            if self.return_sparse_expression:
+                out["x_sparse"] = self._matrix_rows_to_sparse_tensor(
+                    X,
+                    safe_idx.reshape(-1),
+                    valid_expr.reshape(-1),
+                    n_vars=G,
+                )
+                out["x_sparse_shape"] = (B, 1 + k, G)
+            else:
+                expr = matrix_rows_to_numpy(X, safe_idx.reshape(-1)).astype(np.float32, copy=False)
+                expr = torch.from_numpy(expr.reshape(B, 1 + k, G))
+                if not valid_expr.all():
+                    expr[~torch.from_numpy(valid_expr)] = 0
 
-            out["cell"] = cell
-            out["neighbors"] = neighbors
-            if self.include_counts:
-                out["cell_counts"] = cell.sum(dim=-1)
-                out["niche_counts"] = neighbors.sum(dim=-1)
+                cell = expr[:, 0]
+                neighbors = expr[:, 1:]
+
+                out["cell"] = cell
+                out["neighbors"] = neighbors
+                if self.include_counts:
+                    out["cell_counts"] = cell.sum(dim=-1)
+                    out["niche_counts"] = neighbors.sum(dim=-1)
 
             # cell = torch.stack([b["cell"] for b in batch], dim=0)  # [B, G]
             # # G = cell.shape[1]
@@ -308,6 +333,43 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
             out["obs_feature_groups"] = grouped_out
 
         return out
+
+    @staticmethod
+    def _matrix_rows_to_sparse_tensor(X, idx: np.ndarray, valid_rows: np.ndarray, *, n_vars: int) -> torch.Tensor:
+        rows = X[idx]
+        n_rows = int(idx.size)
+
+        if sp.issparse(rows):
+            coo = rows.tocoo(copy=False)
+            keep = valid_rows[coo.row]
+            indices = np.vstack([coo.row[keep], coo.col[keep]]).astype(np.int64, copy=False)
+            values = coo.data[keep].astype(np.float32, copy=False)
+        else:
+            dense = np.asarray(rows, dtype=np.float32)
+            dense[~valid_rows] = 0
+            coo = sp.coo_matrix(dense)
+            indices = np.vstack([coo.row, coo.col]).astype(np.int64, copy=False)
+            values = coo.data.astype(np.float32, copy=False)
+
+        if indices.size == 0:
+            indices_t = torch.empty((2, 0), dtype=torch.long)
+            values_t = torch.empty((0,), dtype=torch.float32)
+        else:
+            indices_t = torch.from_numpy(indices)
+            values_t = torch.from_numpy(values)
+
+        return torch.sparse_coo_tensor(indices_t, values_t, size=(n_rows, n_vars)).coalesce()
+
+    def _make_collate_fn(self, dataset):
+        def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+            self._collate_dataset = dataset
+            self._collate_k = dataset.sampling.k
+            try:
+                return self._collate_fn(batch)
+            finally:
+                self._collate_dataset = None
+                self._collate_k = None
+        return collate
 
     def _make_loader(
         self,
@@ -351,7 +413,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
                 num_workers=loader_cfg.num_workers,
                 pin_memory=loader_cfg.pin_memory,
                 persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
-                collate_fn=self._collate_fn
+                collate_fn=self._make_collate_fn(dataset)
             )
 
         # Non-stratified loader (sequential for val/predict; shuffled for train)
@@ -363,7 +425,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
             pin_memory=loader_cfg.pin_memory,
             persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
             drop_last=loader_cfg.drop_last,
-            collate_fn=self._collate_fn
+            collate_fn=self._make_collate_fn(dataset)
         )
 
     def train_dataloader(self) -> DataLoader:
