@@ -76,7 +76,7 @@ class SlideBlockBatchSampler(Sampler[list[int]]):
         self,
         slide_to_dsidx: list[np.ndarray],
         batch_size: int,
-        block_size: int,
+        block_size: int | None = None,
         *,
         shuffle_within: bool = True,
         shuffle_blocks: bool = True,
@@ -86,7 +86,10 @@ class SlideBlockBatchSampler(Sampler[list[int]]):
     ):
         self.slide_to_dsidx = [np.asarray(x, dtype=np.int64) for x in slide_to_dsidx]
         self.batch_size = int(batch_size)
-        self.block_size = int(block_size)
+        if block_size:
+            self.block_size = int(block_size)
+        else:
+            self.block_size = int(batch_size) // 2
 
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -101,6 +104,12 @@ class SlideBlockBatchSampler(Sampler[list[int]]):
         self.shuffle_batches = shuffle_batches
         self.drop_last = drop_last
         self.rng = np.random.default_rng(seed)
+
+        print(self.slide_to_dsidx)
+
+        for x in self.slide_to_dsidx:
+            print(x)
+            print(len(x))
 
         # Number of blocks produced per slide.
         if drop_last:
@@ -324,8 +333,10 @@ def build_slide_to_dsidx(dataset, slide_key: str = "slide_id") -> list[np.ndarra
 
     slide_codes_ds = slide_codes_all[adata_idx_for_ds]  # length len(dataset)
 
-    n_slides = int(slide_codes_all.max()) + 1  # assumes codes are -1..S-1; strings->category should avoid -1
+    n_slides = len(np.unique(slide_codes_all))  # assumes codes are -1..S-1; strings->category should avoid -1
     slide_to_dsidx = []
     for s in range(n_slides):
-        slide_to_dsidx.append(np.flatnonzero(slide_codes_ds == s).astype(np.int64, copy=False))
+        slide_inds = np.flatnonzero(slide_codes_ds == s).astype(np.int64, copy=False)
+        # if len(slide_inds) > 1:
+        slide_to_dsidx.append(slide_inds)
     return slide_to_dsidx

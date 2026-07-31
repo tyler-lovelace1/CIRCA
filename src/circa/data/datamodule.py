@@ -381,6 +381,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
     ) -> DataLoader:
         if use_slide_batch_sampler:
             slide_to_dsidx = build_slide_to_dsidx(dataset, slide_key=self.slide_key)
+            print(slide_to_dsidx)
             # batch_sampler = InterleavedSlideBatchSampler(
             #     slide_to_dsidx=slide_to_dsidx,
             #     batch_size=loader_cfg.batch_size,
@@ -398,7 +399,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
                 drop_last=loader_cfg.drop_last,
                 seed=self.seed if training else self.seed + 1234,
             )
-            print(batch_sampler)
+            # print(batch_sampler)
             # batch_sampler = EqualExposureSlideBatchSampler(
             #     slide_to_dsidx=slide_to_dsidx,
             #     batch_size=loader_cfg.batch_size,
@@ -451,7 +452,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         return self._make_loader(
             self.ds_predict,
             loader_cfg=self.predict_loader_cfg,
-            use_slide_batch_sampler=self.predict_use_slide_batch_sampler,
+            use_slide_batch_sampler=False,
             training=False,
         )
 

@@ -55,6 +55,7 @@ class CIRCA(L.LightningModule):
         self.phi_share = bool(hparams.get("phi_share", False))
         self.pool_neighbors = bool(hparams.get("pool_neighbors", False))
         self.log_sklearn_metrics = bool(hparams.get("log_sklearn_metrics", False))
+        self.embed_norm = bool(hparams.get("embed_norm", False))
         
         self.warmup_steps = int(hparams.get("warmup_steps", 1000))
 
@@ -114,37 +115,76 @@ class CIRCA(L.LightningModule):
         self.backbone = Net(self.input_dim, self.hidden_dims, activation=self.activation, norm=nn.LayerNorm, dropout=nn.Dropout(p=self.dropout_rate))
                 
         self.state_net = Net(self.hidden_dims[-1], self.proj_hidden_dims, output_dim=self.latent_dim, activation=self.activation, norm=nn.LayerNorm, dropout=nn.Dropout(p=self.dropout_rate))
-        
-        self.cell_net = Net(self.hidden_dims[-1], self.proj_hidden_dims, output_dim=self.latent_dim, activation=self.activation, norm=nn.LayerNorm, dropout=nn.Dropout(p=self.dropout_rate))
 
-        if self.pool_neighbors:
-            self.niche_net = nn.Sequential(
-                NeighborhoodProjectPool(
-                    self.hz_dim, 
-                    project_dim=self.hz_dim//4, 
-                    summary_dim=self.hz_dim//2,
-                    activation=self.activation,
-                    norm=nn.LayerNorm
-                ),
-                nn.LayerNorm(2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4)),
-                Net(
-                    2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4), 
-                    self.proj_hidden_dims, 
+        if self.embed_norm:
+            self.cell_net = nn.Sequential(
+                Net(self.hidden_dims[-1], self.proj_hidden_dims, output_dim=self.latent_dim, activation=self.activation, norm=nn.LayerNorm, dropout=nn.Dropout(p=self.dropout_rate)),
+                nn.BatchNorm1d(self.latent_dim, affine=False)
+            )
+
+            if self.pool_neighbors:
+                self.niche_net = nn.Sequential(
+                    NeighborhoodProjectPool(
+                        self.hz_dim, 
+                        project_dim=self.hz_dim//4, 
+                        summary_dim=self.hz_dim//2,
+                        activation=self.activation,
+                        norm=nn.LayerNorm
+                    ),
+                    nn.LayerNorm(2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4)),
+                    Net(
+                        2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4), 
+                        self.proj_hidden_dims, 
+                        output_dim=self.latent_dim, 
+                        activation=self.activation, 
+                        norm=nn.LayerNorm,
+                        dropout=nn.Dropout(p=self.dropout_rate)
+                       ),
+                    nn.BatchNorm1d(self.latent_dim, affine=False)
+                )
+            else:
+                self.niche_net = nn.Sequential(
+                    Net(
+                        self.n_neighbors * self.hidden_dims[-1],
+                        self.proj_hidden_dims,
+                        output_dim=self.latent_dim, 
+                        activation=self.activation, 
+                        norm=nn.LayerNorm, 
+                        dropout=nn.Dropout(p=self.dropout_rate)
+                    ),
+                    nn.BatchNorm1d(self.latent_dim, affine=False)
+                )
+        else:
+            self.cell_net = Net(self.hidden_dims[-1], self.proj_hidden_dims, output_dim=self.latent_dim, activation=self.activation, norm=nn.LayerNorm, dropout=nn.Dropout(p=self.dropout_rate))
+    
+            if self.pool_neighbors:
+                self.niche_net = nn.Sequential(
+                    NeighborhoodProjectPool(
+                        self.hz_dim, 
+                        project_dim=self.hz_dim//4, 
+                        summary_dim=self.hz_dim//2,
+                        activation=self.activation,
+                        norm=nn.LayerNorm
+                    ),
+                    nn.LayerNorm(2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4)),
+                    Net(
+                        2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4), 
+                        self.proj_hidden_dims, 
+                        output_dim=self.latent_dim, 
+                        activation=self.activation, 
+                        norm=nn.LayerNorm,
+                        dropout=nn.Dropout(p=self.dropout_rate)
+                       )
+                )
+            else:
+                self.niche_net = Net(
+                    self.n_neighbors * self.hidden_dims[-1],
+                    self.proj_hidden_dims,
                     output_dim=self.latent_dim, 
                     activation=self.activation, 
-                    norm=nn.LayerNorm,
+                    norm=nn.LayerNorm, 
                     dropout=nn.Dropout(p=self.dropout_rate)
-                   )
-            )
-        else:
-            self.niche_net = Net(
-                self.n_neighbors * self.hidden_dims[-1],
-                self.proj_hidden_dims,
-                output_dim=self.latent_dim, 
-                activation=self.activation, 
-                norm=nn.LayerNorm, 
-                dropout=nn.Dropout(p=self.dropout_rate)
-            )
+                )
 
         self.psi_nets = nn.ModuleList()
         for i in range(self.num_groups):
@@ -162,15 +202,29 @@ class CIRCA(L.LightningModule):
         self.extra_group_nets = nn.ModuleDict()
         for group_name, group_latent_dim in self.extra_group_latent_dims.items():
             group_input_dim = self.extra_group_input_dims[group_name]
-            
-            self.extra_group_nets[group_name] = Net(
-                (1 + self.n_neighbors) * group_input_dim,
-                self.proj_hidden_dims,
-                output_dim=group_latent_dim,
-                activation=self.activation,
-                norm=nn.LayerNorm,
-                dropout=nn.Dropout(p=self.dropout_rate)
-            )
+
+            if self.embed_norm:
+                self.extra_group_nets[group_name] = nn.Sequential(
+                    Net(
+                        (1 + self.n_neighbors) * group_input_dim,
+                        self.proj_hidden_dims,
+                        output_dim=group_latent_dim,
+                        activation=self.activation,
+                        norm=nn.LayerNorm,
+                        dropout=nn.Dropout(p=self.dropout_rate)
+                    ),
+                    nn.BatchNorm1d(group_latent_dim, affine=False)
+                )
+
+            else:
+                self.extra_group_nets[group_name] = Net(
+                    (1 + self.n_neighbors) * group_input_dim,
+                    self.proj_hidden_dims,
+                    output_dim=group_latent_dim,
+                    activation=self.activation,
+                    norm=nn.LayerNorm,
+                    dropout=nn.Dropout(p=self.dropout_rate)
+                )
        
         if self.phi_type == 'gauss-maxout':
             self.w = nn.Parameter(torch.zeros([self.latent_dim, self.latent_dim, 2, self.num_comb]))
@@ -673,7 +727,7 @@ class CIRCA(L.LightningModule):
         return ((mean_loss + var_loss) * angle_hinge_loss).mean()
 
 
-    def forward(self, x=None, slide_id=None, obs_feature_groups=None, projected_hz=None):
+    def forward(self, x=None, slide_id=None, obs_feature_groups=None, projected_hz=None, generate_permutation=True):
         """
         Args:
             x: Tensor of shape [B, 2 + n_neighbors, input_dim].
@@ -702,13 +756,17 @@ class CIRCA(L.LightningModule):
                     f"[cell, cell_hat, {self.n_neighbors} neighbors], got {G}."
                 )
             hz, hz_state, batch_logits = self._encode_projected(projected_hz)
+            
         extra_group_latents, _ = self._encode_extra_groups(obs_feature_groups)
         if extra_group_latents is not None:
             hz = torch.cat([hz, extra_group_latents], dim=1)
 
-        source_idx, group_idx = generate_block_roll_negatives_index(B, self.num_groups, self.block_size, n_neg_batches=self.n_perms)
-
-        logits = torch.zeros((self.n_perms+1) * B, device=hz.device)
+        if generate_permutation:
+            source_idx, group_idx = generate_block_roll_negatives_index(B, self.num_groups, self.block_size, n_neg_batches=self.n_perms)
+            logits = torch.zeros((self.n_perms+1) * B, device=hz.device)
+        else:
+            logits = torch.zeros(B, device=hz.device)
+            
         l1_loss = torch.zeros(1, device=hz.device)
 
         if self.phi_type=='gauss-maxout':
@@ -739,11 +797,12 @@ class CIRCA(L.LightningModule):
                 # D_h_a = torch.diag(h_a.std(dim=0))
                 # D_h_b = torch.diag(h_b.std(dim=0))
 
-                h_a = torch.cat([h_a, h_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-                h_b = torch.cat([h_b, h_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-
-                z_a = torch.cat([z_a, z_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-                z_b = torch.cat([z_b, z_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                if generate_permutation:
+                    h_a = torch.cat([h_a, h_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    h_b = torch.cat([h_b, h_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+    
+                    z_a = torch.cat([z_a, z_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    z_b = torch.cat([z_b, z_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
             
                 W_ab = self.w[:, :, 0, c]  # (D, D)
                 W_ba = self.w[:, :, 1, c]  # (D, D)
@@ -765,7 +824,8 @@ class CIRCA(L.LightningModule):
             for m in range(self.num_groups):
                 psi_hz[:,m,self.group_latent_valid_mask[m]] = self.psi_nets[m](hz[:,m,:])[:,self.group_latent_valid_mask[m]]
 
-            psi_hz = torch.cat([psi_hz, psi_hz[source_idx, [m for m in range(self.num_groups)]].reshape(self.n_perms * B, self.num_groups, self.latent_dim)], dim=0)
+            if generate_permutation:
+                psi_hz = torch.cat([psi_hz, psi_hz[source_idx, [m for m in range(self.num_groups)]].reshape(self.n_perms * B, self.num_groups, self.latent_dim)], dim=0)
 
             logits_z = torch.sum(self.zw[None, :, :, 0] * psi_hz ** 2 + self.zw[None, :, :, 1] * psi_hz, dim=[1, 2])
 
@@ -822,11 +882,12 @@ class CIRCA(L.LightningModule):
                 # D_h_a = torch.diag(h_a.std(dim=0))
                 # D_h_b = torch.diag(h_b.std(dim=0))
 
-                h_a = torch.cat([h_a, h_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-                h_b = torch.cat([h_b, h_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-
-                z_a = torch.cat([z_a, z_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
-                z_b = torch.cat([z_b, z_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                if generate_permutation:
+                    h_a = torch.cat([h_a, h_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    h_b = torch.cat([h_b, h_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+    
+                    z_a = torch.cat([z_a, z_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    z_b = torch.cat([z_b, z_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
             
                 W_ab = self.w[:, :, 0, c]  # (D, D)
                 W_ba = self.w[:, :, 1, c]  # (D, D)
@@ -855,7 +916,8 @@ class CIRCA(L.LightningModule):
 
             # psi_hz = torch.cat(psi_hz, dim=1)
 
-            psi_hz = torch.cat([psi_hz, psi_hz[source_idx, [m for m in range(self.num_groups)]].reshape(self.n_perms * B, self.num_groups, self.latent_dim)], dim=0)
+            if generate_permutation:
+                psi_hz = torch.cat([psi_hz, psi_hz[source_idx, [m for m in range(self.num_groups)]].reshape(self.n_perms * B, self.num_groups, self.latent_dim)], dim=0)
 
             logits_z = torch.sum(self.zw[None, :, :, 0] * psi_hz ** 2 + self.zw[None, :, :, 1] * psi_hz, dim=[1, 2])
 
@@ -1100,10 +1162,20 @@ class CIRCA(L.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = self._unpack_batch(batch)
-        
-        # No augmentation by default in predict
-        x_in = torch.cat([cell.unsqueeze(1), cell.unsqueeze(1), neighbors], dim=1)  # [B, 2+K, G]
-        hz_gcarl, hz_state, _ = self.encode(x_in.log1p())
+
+        if "x_sparse" in batch:
+            x_sparse = batch["x_sparse"].float()
+            B = batch["x_sparse_shape"][0]
+            # x_in, obs_feature_groups_aug = self.sparse_augment(x_sparse, B, obs_feature_groups=obs_feature_groups, validation=True)
+            projected_hz = self._project_sparse_expression(self._sparse_log1p(x_sparse), B, self.n_neighbors + 1)
+            projected_hz = torch.cat([projected_hz[:,:1,:], projected_hz[:,:1,:], projected_hz[:,1:,:]], dim=1)
+            hz_gcarl, hz_state, _ = self._encode_projected(projected_hz)
+        else:
+            assert neighbors.size(1) == self.n_neighbors
+            B, num_genes = cell.size()
+            # No augmentation by default in predict
+            x_in = torch.cat([cell.unsqueeze(1), cell.unsqueeze(1), neighbors], dim=1)  # [B, 2+K, G]
+            hz_gcarl, hz_state, _ = self.encode(x_in.log1p())
         
         cell_emb, niche_emb = hz_gcarl.split(dim=1, split_size=1)
         
@@ -1167,11 +1239,11 @@ class CIRCA(L.LightningModule):
             #     "interval": "step", 
             # }
             
-        elif self.opt_algo=='radam':
-            optimizer = torch.optim.RAdam(self.parameters(), weight_decay=self.weight_decay, lr=self.learning_rate, decoupled_weight_decay=True)
+        elif self.opt_algo=='adamw_final':
+            optimizer = torch.optim.AdamW(self.parameters(), weight_decay=self.weight_decay, lr=self.learning_rate)
 
             warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
-            decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.estimated_stepping_batches - 2 * self.warmup_steps, eta_min=0.0001 * self.learning_rate)
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.estimated_stepping_batches - self.warmup_steps, eta_min=0.001 * self.learning_rate)
     
             scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, decay], milestones=[self.warmup_steps])
 
@@ -1181,3 +1253,87 @@ class CIRCA(L.LightningModule):
             }
 
         return [optimizer], scheduler_config
+
+
+class CIRCA_Wrapper(nn.Module):
+    def __init__(self, full_model):
+        super().__init__()
+        self.model = full_model
+        self.input_dims = full_model.input_dim
+        self.extra_group_names = full_model.extra_group_names
+        self.extra_group_input_dims = full_model.extra_group_input_dims
+        self.extra_group_latent_dims = full_model.extra_group_latent_dims
+        self.n_neighbors = full_model.n_neighbors
+
+    def forward(self, x):
+        B = x.shape[0]
+        cell = x[:,:self.input_dims]
+        neighbors = x[:,self.input_dims:((self.n_neighbors+1)*self.input_dims)].reshape(B, self.n_neighbors, self.input_dims)
+
+        if not self.extra_group_latent_dims:
+            obs_feature_groups = None
+        else:
+            obs_feature_groups = {}
+            outer_idx = (self.n_neighbors+1)*self.input_dims
+            
+            for group_name in self.extra_group_names:
+                obs_feature_groups[group_name] = {}
+                obs_feature_groups[group_name]['cell'] = x[:,outer_idx:outer_idx+self.extra_group_input_dims[group_name]]
+                obs_feature_groups[group_name]['neighbors'] = x[:,outer_idx+self.extra_group_input_dims[group_name]:outer_idx+(self.n_neighbors+1)*self.extra_group_input_dims[group_name]].reshape(B, self.n_neighbors, self.extra_group_input_dims[group_name])
+
+                outer_idx += (self.n_neighbors+1)*self.extra_group_input_dims[group_name]
+
+        x_in = torch.cat([cell.unsqueeze(1), cell.unsqueeze(1), neighbors], dim=1)
+        
+        logits, _, _ = self.model(x_in, torch.zeros(B), obs_feature_groups, projected_hz=None, generate_permutation=False)
+        return logits[0][:B]
+
+class Cell_Embedding_Wrapper(nn.Module):
+    def __init__(self, full_model):
+        super().__init__()
+        # Point this to your sequential layers or sub-module up to the latent space
+        self.embedding_layers = nn.Sequential(
+            full_model.backbone,
+            full_model.cell_net
+        )
+
+    def forward(self, x, latent_dim_idx=0):
+        # x is your raw gene input: [batch_size × number_of_genes]
+        embeddings = self.embedding_layers(x) # Shape: [batch_size × latent_dimension]
+        
+        # Return only the specific latent dimension scalar for the batch
+        return embeddings[:, latent_dim_idx]
+
+class Niche_Embedding_Wrapper(nn.Module):
+    def __init__(self, full_model):
+        super().__init__()
+        # Point this to your sequential layers or sub-module up to the latent space
+        self.backbone = full_model.backbone
+        self.niche_net = full_model.niche_net
+        self.n_neighbors = full_model.n_neighbors
+        self.pool_neighbors = full_model.pool_neighbors
+
+    def forward(self, x, latent_dim_idx=0):
+        # x is your raw gene input: [batch_size × (n_neighbors * number_of_genes)]
+        hz = self.backbone(x.reshape(x.shape[0], self.n_neighbors, -1)) 
+        if self.pool_neighbors:
+            embeddings = self.niche_net(hz) # Shape: [batch_size × latent_dimension]
+        else:
+            embeddings = self.niche_net(hz.reshape(x.shape[0], -1)) # Shape: [batch_size × latent_dimension]
+        
+        # Return only the specific latent dimension scalar for the batch
+        return embeddings[:, latent_dim_idx]
+
+class ExtraGroup_Embedding_Wrapper(nn.Module):
+    def __init__(self, full_model, group_name):
+        super().__init__()
+        # Point this to your sequential layers or sub-module up to the latent space
+        self.extra_group_nets = full_model.extra_group_nets
+        self.group_name = group_name
+
+    def forward(self, x, latent_dim_idx=0):
+        # x is your raw gene input: [batch_size × number_of_genes]
+        embeddings = self.extra_group_nets[self.group_name](x)
+        
+        # Return only the specific latent dimension scalar for the batch
+        return embeddings[:, latent_dim_idx]
