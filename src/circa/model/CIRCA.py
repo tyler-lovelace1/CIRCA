@@ -8,7 +8,7 @@ import lightning as L
 from sklearn.metrics import f1_score, matthews_corrcoef
 from collections import OrderedDict
 
-from circa.modules.modules import Net, GradReverse, NeighborhoodProjectPool
+from circa.modules.modules import Net, GradReverse, NeighborhoodProjectPool, ChannelwisePiecewiseLinear
 from circa.utils._utils import tqdm
 from circa.utils._torch import (
     scipy_sparse_to_torch,
@@ -240,6 +240,24 @@ class CIRCA(L.LightningModule):
                 self.pw.data[:,0] = 0.25
                 self.pb = nn.Parameter(torch.zeros([self.num_comb]))
 
+        elif self.phi_type == 'gauss-piecewise':
+            self.w = nn.Parameter(torch.zeros([self.latent_dim, self.latent_dim, 2, self.num_comb]))
+            self.zw = nn.Parameter(torch.zeros([self.num_groups, self.latent_dim, 2]))
+
+            if self.phi_share:
+                self.phi_piecewise = ChannelwisePiecewiseLinear(
+                    slopes = [1.0, 0.25, 1.0], 
+                    intercepts = [-0.5, 0.5], 
+                    num_channels = 1
+                )
+                
+            else:
+                self.phi_piecewise = ChannelwisePiecewiseLinear(
+                    slopes = [1.0, 0.25, 1.0], 
+                    intercepts = [-0.5, 0.5], 
+                    num_channels = self.num_comb
+                )
+
         elif self.phi_type == 'gauss-mlp':
             self.w = nn.Parameter(torch.zeros([self.latent_dim, self.latent_dim, 2, self.num_comb]))
             self.zw = nn.Parameter(torch.zeros([self.num_groups, self.latent_dim, 2]))
@@ -336,7 +354,7 @@ class CIRCA(L.LightningModule):
                 self.niche_net(hz[:, 2:, :].reshape((B, self.n_neighbors * self.hz_dim))).unsqueeze(1)
             ], dim=1)
 
-        hz_state = F.normalize(self.state_net(hz[:, :2, :]), dim=2)
+        hz_state = self.state_net(hz[:, :2, :])
 
         batch_logits = None
         if self.use_adv:
@@ -701,7 +719,7 @@ class CIRCA(L.LightningModule):
 
     #     return angle_hinge_loss
 
-    def _compute_symmetry_penalty(self, z, z_nonlin, threshold=0.9):
+    def _compute_regularization_penalty(self, z, z_nonlin, threshold=0.9):
         B, G, D = z.shape
         
         mean = z.mean(dim=0, keepdim=True)
@@ -710,7 +728,7 @@ class CIRCA(L.LightningModule):
         mean_nonlin = z_nonlin.mean(dim=0, keepdim=True)
         z_nonlin_centered = z_nonlin - mean_nonlin
 
-        mean_loss = mean.pow(2).squeeze() # [G x D]
+        scale_loss = F.mse_loss(input=z, target=torch.zeros_like(z), reduction='mean') # [G x D]
         
         std_z = torch.sqrt(z.var(dim=0) + 1e-4)
 
@@ -724,7 +742,7 @@ class CIRCA(L.LightningModule):
             cos_sim_sq = torch.sum(z_dir[:,[a,b]] * z_nonlin_dir[...,c], dim=0).pow(2)
             angle_hinge_loss[[a,b]] += torch.clamp(cos_sim_sq - threshold, min=0).mean()
 
-        return ((mean_loss + var_loss) * angle_hinge_loss).mean()
+        return var_loss.mean() + 0.5 * scale_loss + angle_hinge_loss.mean()
 
 
     def forward(self, x=None, slide_id=None, obs_feature_groups=None, projected_hz=None, generate_permutation=True):
@@ -831,7 +849,76 @@ class CIRCA(L.LightningModule):
 
             logits += logits_z + self.b
 
-        if self.phi_type=='gauss-mlp':
+        elif self.phi_type == 'gauss-piecewise':
+            
+            h_nonlin = self.phi_piecewise(hz[:,:,:,None])
+            
+            h_nonlin = h_nonlin * self.group_latent_valid_mask[None,:,:,None]
+
+            hz_nonlin = torch.empty((B, 2, self.latent_dim, self.num_comb), device=hz.device)
+            
+            for c, (a, b) in enumerate(self.group_pair_indices):
+                
+                if self.phi_share:
+                    h_a = h_nonlin[:, a, :, 0]  # (N, D)
+                    h_b = h_nonlin[:, b, :, 0]  # (N, D)
+                else:
+                    h_a = h_nonlin[:, a, :, c]  # (N, D)
+                    h_b = h_nonlin[:, b, :, c]  # (N, D)
+
+                hz_nonlin[:, 0, :, c] = h_a
+                hz_nonlin[:, 1, :, c] = h_b
+
+                z_a = hz[:, a, :]  # (N, D)
+                z_b = hz[:, b, :]  # (N, D)
+
+                # D_z_a = torch.diag(z_a.std(dim=0))
+                # D_z_b = torch.diag(z_b.std(dim=0))
+
+                # D_h_a = torch.diag(h_a.std(dim=0))
+                # D_h_b = torch.diag(h_b.std(dim=0))
+
+                if generate_permutation:
+                    h_a = torch.cat([h_a, h_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    h_b = torch.cat([h_b, h_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+    
+                    z_a = torch.cat([z_a, z_a[source_idx[:,:,a]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+                    z_b = torch.cat([z_b, z_b[source_idx[:,:,b]].reshape(self.n_perms * B, self.latent_dim)], dim=0)
+            
+                W_ab = self.w[:, :, 0, c]  # (D, D)
+                W_ba = self.w[:, :, 1, c]  # (D, D)
+                
+                # Equivalent to:
+                # torch.sum(W_ab[None] * (h_a[:, :, None] * z_b[:, None, :]), dim=[1, 2])
+                term_ab = (h_a @ W_ab * z_b).sum(dim=1)
+            
+                # Equivalent to:
+                # torch.sum(W_ba[None] * (h_b[:, :, None] * z_a[:, None, :]), dim=[1, 2])
+                term_ba = (h_b @ W_ba * z_a).sum(dim=1)
+            
+                logits = logits + term_ab + term_ba
+
+                # l1_loss = l1_loss + smooth_abs(D_h_a @ W_ab @ D_z_b).mean() + smooth_abs(D_h_b @ W_ba @ D_z_a).mean()
+
+            # psi_hz = []
+            psi_hz = torch.zeros_like(hz)
+            for m in range(self.num_groups):
+                if self.phi_share:
+                    # psi_hz.append(self.psi_nets[m](torch.cat([hz[:,m,:], hp[:,m,:]], dim=1)).unsqueeze(1))
+                    psi_hz[:,m,self.group_latent_valid_mask[m]] = self.psi_nets[m](torch.cat([hz[:,m,:], h_nonlin[:,m,:].squeeze()], dim=1))[:,self.group_latent_valid_mask[m]]
+                else:
+                    # psi_hz.append(self.psi_nets[m](torch.cat([hz[:,m,:], F.tanh(hz[:,m,:])], dim=1)).unsqueeze(1))
+                    psi_hz[:,m,self.group_latent_valid_mask[m]] = self.psi_nets[m](torch.cat([hz[:,m,:], F.tanh(hz[:,m,:])], dim=1))[:,self.group_latent_valid_mask[m]]
+
+
+            if generate_permutation:
+                psi_hz = torch.cat([psi_hz, psi_hz[source_idx, [m for m in range(self.num_groups)]].reshape(self.n_perms * B, self.num_groups, self.latent_dim)], dim=0)
+
+            logits_z = torch.sum(self.zw[None, :, :, 0] * psi_hz ** 2 + self.zw[None, :, :, 1] * psi_hz, dim=[1, 2])
+
+            logits += logits_z + self.b
+
+        elif self.phi_type=='gauss-mlp':
 
             hz_nonlin = torch.empty((B, 2, self.latent_dim, self.num_comb), device=hz.device)
 
@@ -923,9 +1010,13 @@ class CIRCA(L.LightningModule):
 
             logits += logits_z + self.b
 
-        sym_loss = self._compute_symmetry_penalty(hz, hz_nonlin)
+        sym_loss = self._compute_regularization_penalty(hz, hz_nonlin)
+
+        state_embeddings = F.normalize(torch.cat([hz_state[:,0,:], hz_state[:,1,:]], dim=0), dim=1)
+
+        # hz_state[:,0,:] @ hz_state[:,1,:].T / torch.exp(self.tau)
         
-        return [logits, hz_state[:,0,:] @ hz_state[:,1,:].T / torch.exp(self.tau)], batch_logits, sym_loss
+        return [logits, state_embeddings @ state_embeddings.T / torch.exp(self.tau)], batch_logits, sym_loss
 
     def training_step(self, train_batch, batch_idx):
         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = self._unpack_batch(train_batch)
@@ -956,13 +1047,18 @@ class CIRCA(L.LightningModule):
             dim=0
         )
         
-        labels = torch.cat([torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
+        labels = torch.cat([B + torch.arange(B, device=logits[0].device, dtype=torch.long), torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
 
-        valid = slide_id[:, None].eq(slide_id[None, :])
+        dup_slide_id = torch.cat([slide_id, slide_id], dim=0)
+        
+        valid = dup_slide_id[:, None].eq(dup_slide_id[None, :])
 
         logits_state = logits[1].masked_fill(~valid, float("-inf"))
 
-        state_loss = 0.5 * self.state_criterion(logits_state, labels) + 0.5 * self.state_criterion(logits_state.T, labels)
+        logits_state = logits[1].masked_fill(torch.eye(2 * B, dtype=torch.bool, device=logits[1].device), float("-inf"))
+
+        # state_loss = 0.5 * self.state_criterion(logits_state, labels) + 0.5 * self.state_criterion(logits_state.T, labels)
+        state_loss = self.state_criterion(logits_state, labels)
 
         adv_loss = torch.zeros((), device=self.device)
         if self.use_adv and (batch_logits is not None):
@@ -1003,9 +1099,8 @@ class CIRCA(L.LightningModule):
 
         # self.log('train_l1', l1_loss, on_epoch=True)
 
-        _, pred0 = torch.max(logits[1], dim=0)
-        _, pred1 = torch.max(logits[1], dim=1)
-        acc = ((pred0 == labels).float().mean() + (pred1 == labels).float().mean()) / 2.0
+        _, pred = torch.max(logits_state, dim=1)
+        acc = (pred == labels).float().mean() # + (pred1 == labels).float().mean()) / 2.0
 
         self.log('train_state_acc', torch.tensor([acc]), on_epoch=True)
 
@@ -1066,13 +1161,25 @@ class CIRCA(L.LightningModule):
             dim=0
         )
         
-        labels = torch.cat([torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
+        # labels = torch.cat([torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
 
-        valid = slide_id[:, None].eq(slide_id[None, :])
+        # valid = slide_id[:, None].eq(slide_id[None, :])
+
+        # logits_state = logits[1].masked_fill(~valid, float("-inf"))
+
+        # state_loss = 0.5 * self.state_criterion(logits_state, labels) + 0.5 * self.state_criterion(logits_state.T, labels)
+
+        labels = torch.cat([B + torch.arange(B, device=logits[0].device, dtype=torch.long), torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
+
+        dup_slide_id = torch.cat([slide_id, slide_id], dim=0)
+        
+        valid = dup_slide_id[:, None].eq(dup_slide_id[None, :])
 
         logits_state = logits[1].masked_fill(~valid, float("-inf"))
 
-        state_loss = 0.5 * self.state_criterion(logits_state, labels) + 0.5 * self.state_criterion(logits_state.T, labels)
+        logits_state = logits[1].masked_fill(torch.eye(2 * B, dtype=torch.bool, device=logits[1].device), float("-inf"))
+
+        state_loss = self.state_criterion(logits_state, labels)
 
         adv_loss = torch.zeros((), device=self.device)
         if self.use_adv and (batch_logits is not None):
@@ -1119,9 +1226,12 @@ class CIRCA(L.LightningModule):
 
         # self.log('valid_l1', dir_loss, on_epoch=True)
 
-        _, pred0 = torch.max(logits[1], dim=0)
-        _, pred1 = torch.max(logits[1], dim=1)
-        acc = ((pred0 == labels).float().mean() + (pred1 == labels).float().mean()) / 2.0
+        _, pred = torch.max(logits_state, dim=1)
+        acc = (pred == labels).float().mean()
+
+        # _, pred0 = torch.max(logits[1], dim=0)
+        # _, pred1 = torch.max(logits[1], dim=1)
+        # acc = ((pred0 == labels).float().mean() + (pred1 == labels).float().mean()) / 2.0
 
         self.log('valid_state_acc', torch.tensor([acc]), on_epoch=True)
 

@@ -180,3 +180,52 @@ class Net(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class PiecewiseLinear(nn.Module):
+    def __init__(self, slopes, intercepts):
+        super().__init__()
+        # Initializing global scalar parameters
+        self.m1 = nn.Parameter(torch.tensor(slopes[0]))
+        self.m2 = nn.Parameter(torch.tensor(slopes[1]))
+        self.m3 = nn.Parameter(torch.tensor(slopes[2]))
+        self.b1 = nn.Parameter(torch.tensor(intercepts[0]))
+        self.b2 = nn.Parameter(torch.tensor(intercepts[1]))
+
+    def forward(self, x):
+        # max(0, x - b) using torch.clamp
+        ramp1 = torch.clamp(x - self.b1, min=0)
+        ramp2 = torch.clamp(x - self.b2, min=0)
+        
+        # Calculate dynamic intercept to force y(0) = 0 even if b1 or b2 are negative
+        intercept = -(self.m1 - self.m2) * torch.clamp(-self.b1, min=0) - (self.m2 - self.m3) * torch.clamp(-self.b2, min=0)
+        
+        y = self.m1 * x + (self.m1 - self.m2) * ramp1 + (self.m2 - self.m3) * ramp2 + intercept
+        return y
+
+class ChannelwisePiecewiseLinear(nn.Module):
+    def __init__(self, slopes, intercepts, num_channels):
+        super().__init__()
+        self.num_channels = num_channels
+        
+        # Initialize parameters as vectors of size (C,)
+        self.m1 = nn.Parameter(torch.full((1,1,1,num_channels), slopes[0]))
+        self.m2 = nn.Parameter(torch.full((1,1,1,num_channels), slopes[1]))
+        self.m3 = nn.Parameter(torch.full((1,1,1,num_channels), slopes[2]))
+        
+        # Initialize breakpoints (e.g., spaced out parameters)
+        self.b1 = nn.Parameter(torch.full((1,1,1,num_channels), intercepts[0]))
+        self.b2 = nn.Parameter(torch.full((1,1,1,num_channels), intercepts[1]))
+
+    def forward(self, x):
+        # x shape: [B, G, D, C]
+        # self.b1 shape: [C] -> automatically broadcasts to [B, G, D, C]
+        ramp1 = torch.clamp(x - self.b1, min=0)
+        ramp2 = torch.clamp(x - self.b2, min=0)
+        
+        # Compute channel-specific zero-intercept corrections
+        intercept = -(self.m2 - self.m1) * torch.clamp(-self.b1, min=0) - (self.m3 - self.m2) * torch.clamp(-self.b2, min=0)
+        
+        # Compute vectorized piecewise transformation
+        y = self.m1 * x + (self.m2 - self.m1) * ramp1 + (self.m3 - self.m2) * ramp2 + intercept
+        return y
+
