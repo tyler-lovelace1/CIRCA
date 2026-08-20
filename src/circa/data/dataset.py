@@ -482,6 +482,33 @@ class SpatialNeighborhoodDataset(Dataset):
 
         return out
 
+    def __getitems__(self, indices: Sequence[int]) -> List[Dict[str, Any]]:
+        """Load a batch without materializing metadata one sample at a time.
+
+        PyTorch's map-style ``DataLoader`` uses this method when available.  The
+        data-module collator can gather obs features and expression in one
+        vectorized operation, so constructing those tensors in every
+        ``__getitem__`` call is pure overhead during training.
+        """
+        batch: List[Dict[str, Any]] = []
+        for j in indices:
+            i = int(self.indices[j])
+            idx_row = self.nbr_idx[i, :self.M]
+            dist_row = self.nbr_dist[i, :self.M]
+            if self.training and self.sampling.sample_with_invdist and self.M > self.sampling.k:
+                neigh_i, dist_i = self._sample_k_from_topM(idx_row, dist_row)
+            else:
+                idxs = idx_row[:self.sampling.k]
+                dists = dist_row[:self.sampling.k]
+                valid = idxs >= 0
+                neigh_i, dist_i = idxs[valid], dists[valid]
+            batch.append({
+                "adata_idx": i,
+                "neighbor_idx": neigh_i,
+                "neighbor_dist": dist_i,
+            })
+        return batch
+
 @dataclass
 class SimulationConfig:
     k: int = 10

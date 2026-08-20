@@ -1181,7 +1181,7 @@ class CIRCA(L.LightningModule):
         pred = (logits[0]>0).float()
         acc = (pred == gcarl_labels).float().mean()
 
-        self.log('train_acc', torch.tensor([acc]), on_epoch=True)
+        self.log('train_acc', acc, on_epoch=True)
 
         if self.log_sklearn_metrics:
             self.log('train_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
@@ -1202,11 +1202,11 @@ class CIRCA(L.LightningModule):
         _, pred = torch.max(logits_state, dim=1)
         acc = (pred == labels).float().mean() # + (pred1 == labels).float().mean()) / 2.0
 
-        self.log('train_state_acc', torch.tensor([acc]), on_epoch=True)
+        self.log('train_state_acc', acc, on_epoch=True)
 
         if self.log_sklearn_metrics:
-            self.log('train_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-            self.log('train_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            self.log('train_state_f1', torch.tensor([f1_score(labels.detach().cpu().numpy(), pred.detach().cpu().numpy(), average='macro')]), on_epoch=True)
+            self.log('train_state_mcc', torch.tensor([matthews_corrcoef(labels.detach().cpu().numpy(), pred.detach().cpu().numpy())]), on_epoch=True)
 
         if self.use_adv:
             self.log('train_batch_loss', adv_loss, on_epoch=True)
@@ -1214,7 +1214,7 @@ class CIRCA(L.LightningModule):
             _, pred = torch.max(batch_logits[0], dim=1)
             acc = (pred.reshape(-1,1) == panel_labels.reshape(-1,1)).float().mean()
         
-            self.log('train_panel_acc', torch.tensor([acc]), on_epoch=True)
+            self.log('train_panel_acc', acc, on_epoch=True)
 
             if self.log_sklearn_metrics:
                 self.log('train_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
@@ -1224,7 +1224,7 @@ class CIRCA(L.LightningModule):
                 _, pred = torch.max(batch_logits[1], dim=1)
                 acc = (pred.reshape(-1,1) == slide_labels.reshape(-1,1)).float().mean()
             
-                self.log('train_slide_acc', torch.tensor([acc]), on_epoch=True)
+                self.log('train_slide_acc', acc, on_epoch=True)
 
                 if self.log_sklearn_metrics:
                     self.log('train_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
@@ -1310,7 +1310,7 @@ class CIRCA(L.LightningModule):
         pred = (logits[0]>0).float()
         acc = (pred == gcarl_labels).float().mean()
 
-        self.log('valid_acc', torch.tensor([acc]), on_epoch=True)
+        self.log('valid_acc', acc, on_epoch=True)
 
         if self.log_sklearn_metrics:
             self.log('valid_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
@@ -1335,11 +1335,11 @@ class CIRCA(L.LightningModule):
         # _, pred1 = torch.max(logits[1], dim=1)
         # acc = ((pred0 == labels).float().mean() + (pred1 == labels).float().mean()) / 2.0
 
-        self.log('valid_state_acc', torch.tensor([acc]), on_epoch=True)
+        self.log('valid_state_acc', acc, on_epoch=True)
 
         if self.log_sklearn_metrics:
-            self.log('valid_state_f1', torch.tensor([f1_score(labels.detach().reshape(-1,1).cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
-            self.log('valid_state_mcc', torch.tensor([matthews_corrcoef(labels.reshape(-1,1).detach().cpu().numpy(), pred0.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
+            self.log('valid_state_f1', torch.tensor([f1_score(labels.detach().cpu().numpy(), pred.detach().cpu().numpy(), average='macro')]), on_epoch=True)
+            self.log('valid_state_mcc', torch.tensor([matthews_corrcoef(labels.detach().cpu().numpy(), pred.detach().cpu().numpy())]), on_epoch=True)
 
         # Extract and log the current learning rate
         opt = self.optimizers()
@@ -1354,7 +1354,7 @@ class CIRCA(L.LightningModule):
             _, pred = torch.max(batch_logits[0], dim=1)
             acc = (pred.reshape(-1,1) == panel_labels.reshape(-1,1)).float().mean()
         
-            self.log('valid_panel_acc', torch.tensor([acc]), on_epoch=True)
+            self.log('valid_panel_acc', acc, on_epoch=True)
 
             if self.log_sklearn_metrics:
                 self.log('valid_panel_f1', torch.tensor([f1_score(panel_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)
@@ -1364,7 +1364,7 @@ class CIRCA(L.LightningModule):
                 _, pred = torch.max(batch_logits[1], dim=1)
                 acc = (pred.reshape(-1,1) == slide_labels.reshape(-1,1)).float().mean()
             
-                self.log('valid_slide_acc', torch.tensor([acc]), on_epoch=True)
+                self.log('valid_slide_acc', acc, on_epoch=True)
 
                 if self.log_sklearn_metrics:
                     self.log('valid_slide_f1', torch.tensor([f1_score(slide_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy(), average='macro')]), on_epoch=True)

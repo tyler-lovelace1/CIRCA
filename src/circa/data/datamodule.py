@@ -22,6 +22,7 @@ class LoaderConfig:
     pin_memory: bool = False
     drop_last: bool = True
     persistent_workers: bool = True 
+    prefetch_factor: Optional[int] = 2
 
 class SpatialNeighborhoodDataModule(L.LightningDataModule):
     """
@@ -225,27 +226,29 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
           - obs_keys as lists (or you can tensorize categoricals separately if you want)
         """
         B = len(batch)
-        k = getattr(self, "_collate_k", batch[0]["neighbor_idx"].numel())
+        dataset = getattr(self, "_collate_dataset", None)
+        k = self._collate_k if getattr(self, "_collate_k", None) is not None else len(batch[0]["neighbor_idx"])
         G = self.adata.shape[1]
-        X = getattr(getattr(self, "_collate_dataset", None), "_X", None)
+        X = getattr(dataset, "_X", None)
         if X is None:
             X = self.adata.X
 
-        out: Dict[str, Any] = {}
-        out["adata_idx"] = torch.tensor([b["adata_idx"] for b in batch], dtype=torch.long)
-
-        neigh_idx = torch.full((B, k), -1, dtype=torch.long)
-        neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
+        adata_idx_np = np.fromiter((b["adata_idx"] for b in batch), dtype=np.int64, count=B)
+        neigh_idx_np = np.full((B, k), -1, dtype=np.int64)
+        neigh_dist_np = np.full((B, k), np.inf, dtype=np.float32)
         for bi, b in enumerate(batch):
-            ni = b["neighbor_idx"]
-            nd = b["neighbor_dist"]
-            m = min(k, ni.numel())
+            ni = np.asarray(b["neighbor_idx"], dtype=np.int64)
+            nd = np.asarray(b["neighbor_dist"], dtype=np.float32)
+            m = min(k, ni.size)
             if m > 0:
-                neigh_idx[bi, :m] = ni[:m]
-                neigh_dist[bi, :m] = nd[:m]
+                neigh_idx_np[bi, :m] = ni[:m]
+                neigh_dist_np[bi, :m] = nd[:m]
 
-        out["neighbor_idx"] = neigh_idx
-        out["neighbor_dist"] = neigh_dist
+        out: Dict[str, Any] = {
+            "adata_idx": torch.from_numpy(adata_idx_np),
+            "neighbor_idx": torch.from_numpy(neigh_idx_np),
+            "neighbor_dist": torch.from_numpy(neigh_dist_np),
+        }
 
         # neigh_idx = torch.full((B, k), -1, dtype=torch.long)
         # neigh_dist = torch.full((B, k), float("inf"), dtype=torch.float32)
@@ -261,14 +264,16 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         # out["neighbor_idx"] = neigh_idx
         # out["neighbor_dist"] = neigh_dist
 
-        for key in self.obs_keys:
-            out[key] = torch.tensor([b[key] for b in batch])
-
-        for key in ("slide_id", "panel"):
-            out[key] = torch.tensor([b[key] for b in batch])
+        for key in dict.fromkeys((*self.obs_keys, "slide_id", "panel")):
+            source_key = key
+            if key == "slide_id":
+                source_key = dataset.slide_key
+            elif key == "panel":
+                source_key = dataset.panel_key
+            out[key] = torch.as_tensor(dataset._obs[source_key][adata_idx_np])
 
         if self.return_expression:
-            all_idx = torch.cat([out["adata_idx"][:, None], out["neighbor_idx"]], dim=1).numpy()
+            all_idx = np.concatenate((adata_idx_np[:, None], neigh_idx_np), axis=1)
             valid_expr = all_idx >= 0
             safe_idx = all_idx.copy()
             safe_idx[~valid_expr] = 0
@@ -317,17 +322,14 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         if self.obs_feature_groups:
             grouped_out: Dict[str, Dict[str, torch.Tensor]] = {}
             for group_name in self.obs_feature_groups:
-                cell_feat = torch.stack(
-                    [b["obs_feature_groups"][group_name]["cell"] for b in batch], dim=0
-                )
-                Fdim = cell_feat.shape[1]
-                neigh_feat = torch.zeros((B, k, Fdim), dtype=torch.float32)
-                for bi, b in enumerate(batch):
-                    xn = b["obs_feature_groups"][group_name]["neighbors"]
-                    m = min(k, xn.shape[0])
-                    if m > 0:
-                        neigh_feat[bi, :m] = xn[:m]
-
+                group_mat = dataset._obs_feature_mats[group_name]
+                safe_neigh_idx = neigh_idx_np.copy()
+                valid_neigh = safe_neigh_idx >= 0
+                safe_neigh_idx[~valid_neigh] = 0
+                cell_feat = torch.from_numpy(group_mat[adata_idx_np])
+                neigh_feat = torch.from_numpy(group_mat[safe_neigh_idx].copy())
+                if not valid_neigh.all():
+                    neigh_feat[~torch.from_numpy(valid_neigh)] = 0
                 grouped_out[group_name] = {"cell": cell_feat, "neighbors": neigh_feat}
 
             out["obs_feature_groups"] = grouped_out
@@ -379,6 +381,10 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
         use_slide_batch_sampler: bool,
         training: bool,
     ) -> DataLoader:
+        worker_kwargs = {}
+        if loader_cfg.num_workers > 0 and loader_cfg.prefetch_factor is not None:
+            worker_kwargs["prefetch_factor"] = loader_cfg.prefetch_factor
+
         if use_slide_batch_sampler:
             slide_to_dsidx = build_slide_to_dsidx(dataset, slide_key=self.slide_key)
             # print(slide_to_dsidx)
@@ -414,7 +420,8 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
                 num_workers=loader_cfg.num_workers,
                 pin_memory=loader_cfg.pin_memory,
                 persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
-                collate_fn=self._make_collate_fn(dataset)
+                collate_fn=self._make_collate_fn(dataset),
+                **worker_kwargs,
             )
 
         # Non-stratified loader (sequential for val/predict; shuffled for train)
@@ -426,7 +433,8 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
             pin_memory=loader_cfg.pin_memory,
             persistent_workers=loader_cfg.persistent_workers and loader_cfg.num_workers > 0,
             drop_last=loader_cfg.drop_last,
-            collate_fn=self._make_collate_fn(dataset)
+            collate_fn=self._make_collate_fn(dataset),
+            **worker_kwargs,
         )
 
     def train_dataloader(self) -> DataLoader:
