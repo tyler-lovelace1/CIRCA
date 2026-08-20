@@ -105,11 +105,11 @@ class SlideBlockBatchSampler(Sampler[list[int]]):
         self.drop_last = drop_last
         self.rng = np.random.default_rng(seed)
 
-        print(self.slide_to_dsidx)
+        # print(self.slide_to_dsidx)
 
-        for x in self.slide_to_dsidx:
-            print(x)
-            print(len(x))
+        # for x in self.slide_to_dsidx:
+        #     print(x)
+        #     print(len(x))
 
         # Number of blocks produced per slide.
         if drop_last:

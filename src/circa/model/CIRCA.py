@@ -59,6 +59,8 @@ class CIRCA(L.LightningModule):
         
         self.warmup_steps = int(hparams.get("warmup_steps", 1000))
 
+        self.cell_resolution = bool(hparams.get("cell_resolution", True))
+
         self.use_adv = bool(hparams.get("use_adv", False))
         self.use_slide_adv = bool(hparams.get("use_slide_adv", False))  # only relevant if use_adv
         self.adv_weight = float(hparams.get("adv_weight", 1.0))
@@ -67,7 +69,9 @@ class CIRCA(L.LightningModule):
 
         self.patience = int(hparams.get("patience", 10))
 
-        self.sym_lam = float(hparams.get("sym_lam", 0.01))
+        self.l1_lam = float(hparams.get("l1_lam", 0.001))
+
+        self.sym_lam = float(hparams.get("sym_lam", 2 * self.l1_lam))
 
         self.state_lam = float(hparams.get("state_lam", 1.0))
         
@@ -129,7 +133,9 @@ class CIRCA(L.LightningModule):
                         project_dim=self.hz_dim//4, 
                         summary_dim=self.hz_dim//2,
                         activation=self.activation,
-                        norm=nn.LayerNorm
+                        norm=nn.LayerNorm, 
+                        # beta_init = 0.25,
+                        weighted = False,
                     ),
                     nn.LayerNorm(2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4)),
                     Net(
@@ -164,7 +170,9 @@ class CIRCA(L.LightningModule):
                         project_dim=self.hz_dim//4, 
                         summary_dim=self.hz_dim//2,
                         activation=self.activation,
-                        norm=nn.LayerNorm
+                        norm=nn.LayerNorm, 
+                        # beta_init = 0.25,
+                        weighted = False,
                     ),
                     nn.LayerNorm(2 * (self.hz_dim//2) + self.n_neighbors * (self.hz_dim//4)),
                     Net(
@@ -190,7 +198,7 @@ class CIRCA(L.LightningModule):
         for i in range(self.num_groups):
             self.psi_nets.append(
                 Net(
-                    self.latent_dim if self.phi_type=='gauss-maxout' else 2 * self.latent_dim, 
+                    self.latent_dim if self.phi_type=='gauss-maxout' or self.phi_type=='gauss-abs' else 2 * self.latent_dim, 
                     self.psi_hidden_dims, 
                     output_dim=self.latent_dim, 
                     activation=self.activation, 
@@ -232,12 +240,26 @@ class CIRCA(L.LightningModule):
 
             if self.phi_share:
                 self.pw = nn.Parameter(torch.ones([1, 2]))
-                self.pw.data[0,0] = 0.25
+                self.pw.data[0,0] = 0.2
                 self.pb = nn.Parameter(torch.zeros([1]))
                 
             else:
                 self.pw = nn.Parameter(torch.ones([self.num_comb, 2]))
-                self.pw.data[:,0] = 0.25
+                self.pw.data[:,0] = 0.2
+                self.pb = nn.Parameter(torch.zeros([self.num_comb]))
+
+        elif self.phi_type == 'gauss-abs':
+            self.w = nn.Parameter(torch.zeros([self.latent_dim, self.latent_dim, 2, self.num_comb]))
+            self.zw = nn.Parameter(torch.zeros([self.num_groups, self.latent_dim, 2]))
+
+            if self.phi_share:
+                self.pw = nn.Parameter(torch.ones([1, 2]))
+                self.pw.data[0,0] = -1.0
+                self.pb = nn.Parameter(torch.zeros([1]))
+                
+            else:
+                self.pw = nn.Parameter(torch.ones([self.num_comb, 2]))
+                self.pw.data[:,0] = -1.0
                 self.pb = nn.Parameter(torch.zeros([self.num_comb]))
 
         elif self.phi_type == 'gauss-piecewise':
@@ -246,15 +268,15 @@ class CIRCA(L.LightningModule):
 
             if self.phi_share:
                 self.phi_piecewise = ChannelwisePiecewiseLinear(
-                    slopes = [1.0, 0.25, 1.0], 
-                    intercepts = [-0.5, 0.5], 
+                    slopes = [1.0, 0.1, 1.0], 
+                    intercepts = [-1.0, 1.0], 
                     num_channels = 1
                 )
                 
             else:
                 self.phi_piecewise = ChannelwisePiecewiseLinear(
-                    slopes = [1.0, 0.25, 1.0], 
-                    intercepts = [-0.5, 0.5], 
+                    slopes = [1.0, 0.1, 1.0], 
+                    intercepts = [-1.0, 1.0], 
                     num_channels = self.num_comb
                 )
 
@@ -321,19 +343,48 @@ class CIRCA(L.LightningModule):
                 if m.bias != None:
                     nn.init.constant_(m.bias, 0.0)
 
-        if 'mlp' in self.phi_type:
-            for m in self.phi_nets.modules():
-                if isinstance(self.activation, nn.LeakyReLU):
-                    nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=self.activation.negative_slope)
-                    m.weight.data *= 0.1
-                elif isinstance(self.activation, nn.ReLU):
-                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                    m.weight.data *= 0.1
-                else:
-                    nn.init.xavier_normal_(m.weight)
-                    m.weight.data *= 0.1
-                if m.bias != None:
-                    nn.init.constant_(m.bias, 0.0)
+        # if 'mlp' in self.phi_type:
+        #     for m in self.phi_nets.modules():
+        #         if isinstance(self.activation, nn.LeakyReLU):
+        #             nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu', a=self.activation.negative_slope)
+        #             m.weight.data *= 0.1
+        #         elif isinstance(self.activation, nn.ReLU):
+        #             nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        #             m.weight.data *= 0.1
+        #         else:
+        #             nn.init.xavier_normal_(m.weight)
+        #             m.weight.data *= 0.1
+        #         if m.bias != None:
+        #             nn.init.constant_(m.bias, 0.0)
+
+        if self.embed_norm:
+            nn.init.orthogonal_(self.cell_net[0].net[-1].weight)
+            if self.pool_neighbors:
+                nn.init.orthogonal_(self.niche_net[-2].net[-1].weight)
+            else:
+                nn.init.orthogonal_(self.niche_net[0].net[-1].weight)
+    
+            for group_name, group_latent_dim in self.extra_group_latent_dims.items():
+                nn.init.orthogonal_(self.extra_group_nets[group_name][0].net[-1].weight)
+        else:
+            nn.init.orthogonal_(self.cell_net.net[-1].weight)
+            if self.pool_neighbors:
+                nn.init.orthogonal_(self.niche_net[-1].net[-1].weight)
+            else:
+                nn.init.orthogonal_(self.niche_net.net[-1].weight)
+    
+            for group_name, group_latent_dim in self.extra_group_latent_dims.items():
+                nn.init.orthogonal_(self.extra_group_nets[group_name].net[-1].weight)
+
+        # self.cell_net.net[-1].weight.data *= 0.01
+        
+        # if self.pool_neighbors:
+        #     self.niche_net[-1].net[-1].weight.data *= 0.01
+        # else:
+        #     self.niche_net.net[-1].weight.data *= 0.01
+
+        # for group_name, group_latent_dim in self.extra_group_latent_dims.items():
+        #     self.extra_group_nets[group_name].net[-1].weight.data *= 0.01
 
     def _compute_grl_lambda(self):
         if self._trainer is not None and self.training:
@@ -435,7 +486,7 @@ class CIRCA(L.LightningModule):
             panel_probs = torch.ones(self.n_panels, device=device) / self.n_panels
             panel_types = torch.multinomial(panel_probs, 2, replacement=False)
 
-        drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
+        drop_rate = self.mask_prop # np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
 
         rows = torch.arange(batch_size * K, device=device)
         channel = rows.remainder(K)
@@ -542,7 +593,8 @@ class CIRCA(L.LightningModule):
             panel_types = torch.multinomial(panel_probs, 2, replacement=False)
 
         ## sample drop_rate from beta distribution with expected value of mask_prop
-        drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
+        # drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
+        drop_rate = self.mask_prop
 
         # counts: [B, G]
         totals = x.sum(dim=2, keepdim=True)
@@ -607,7 +659,7 @@ class CIRCA(L.LightningModule):
             panel_types = torch.multinomial(panel_probs, 2, replacement=False)
 
         ## sample drop_rate from beta distribution with expected value of mask_prop
-        drop_rate = np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
+        drop_rate = self.mask_prop # np.random.beta(self.mask_prop * 9 / (1 - self.mask_prop), 9)
 
         # counts: [B, G]
         totals = cell_hat.sum(dim=1, keepdim=True)
@@ -728,7 +780,9 @@ class CIRCA(L.LightningModule):
         mean_nonlin = z_nonlin.mean(dim=0, keepdim=True)
         z_nonlin_centered = z_nonlin - mean_nonlin
 
-        scale_loss = F.mse_loss(input=z, target=torch.zeros_like(z), reduction='mean') # [G x D]
+        # scale_loss = F.mse_loss(input=z, target=torch.zeros_like(z), reduction='mean') # [G x D]
+
+        mean_loss = mean.pow(2).mean()
         
         std_z = torch.sqrt(z.var(dim=0) + 1e-4)
 
@@ -742,8 +796,43 @@ class CIRCA(L.LightningModule):
             cos_sim_sq = torch.sum(z_dir[:,[a,b]] * z_nonlin_dir[...,c], dim=0).pow(2)
             angle_hinge_loss[[a,b]] += torch.clamp(cos_sim_sq - threshold, min=0).mean()
 
-        return var_loss.mean() + 0.5 * scale_loss + angle_hinge_loss.mean()
+        return var_loss.mean() + mean_loss + angle_hinge_loss.mean()
 
+    def _compute_symmetry_penalty(self, z, z_nonlin, threshold=0.9):
+        B, G, D = z.shape
+        
+        mean = z.mean(dim=0, keepdim=True)
+        z_centered = z - mean
+
+        mean_nonlin = z_nonlin.mean(dim=0, keepdim=True)
+        z_nonlin_centered = z_nonlin - mean_nonlin
+
+        # scale_loss = F.mse_loss(input=z, target=torch.zeros_like(z), reduction='mean') # [G x D]
+
+        # mean_loss = mean.pow(2).mean()
+        
+        # std_z = torch.sqrt(z.var(dim=0) + 1e-4)
+
+        # var_loss = torch.clamp(1 - std_z, min=0) # [G x D]
+
+        z_dir = F.normalize(z_centered, dim=0)
+        z_nonlin_dir =F.normalize(z_nonlin_centered, dim=0)
+        
+        angle_hinge_loss = torch.zeros([self.num_groups, self.latent_dim], device=z.device)
+        for c, (a,b) in enumerate(self.group_pair_indices):
+            cos_sim_sq = torch.sum(z_dir[:,[a,b]] * z_nonlin_dir[...,c], dim=0).pow(2)
+            angle_hinge_loss[[a,b]] += torch.clamp(cos_sim_sq - threshold, min=0).mean()
+
+        return angle_hinge_loss.mean() * self.latent_dim
+
+    def _compute_covariance_regularizer(self, z):
+        B, G, D = z.shape
+        diag_mask = torch.eye(D, device=z.device, dtype=torch.bool)
+        cov_mat = torch.einsum("b...i,b...j->...ij", z, z) / (B-1)
+
+        cov_loss = cov_mat[..., ~diag_mask].pow(2).sum() / (G * D)
+
+        return cov_loss
 
     def forward(self, x=None, slide_id=None, obs_feature_groups=None, projected_hz=None, generate_permutation=True):
         """
@@ -779,15 +868,17 @@ class CIRCA(L.LightningModule):
         if extra_group_latents is not None:
             hz = torch.cat([hz, extra_group_latents], dim=1)
 
+        # cov_loss = self._compute_covariance_regularizer(hz)
+
         if generate_permutation:
             source_idx, group_idx = generate_block_roll_negatives_index(B, self.num_groups, self.block_size, n_neg_batches=self.n_perms)
             logits = torch.zeros((self.n_perms+1) * B, device=hz.device)
         else:
             logits = torch.zeros(B, device=hz.device)
             
-        l1_loss = torch.zeros(1, device=hz.device)
+        # l1_loss = torch.zeros(1, device=hz.device)
 
-        if self.phi_type=='gauss-maxout':
+        if self.phi_type=='gauss-maxout' or self.phi_type=='gauss-abs':
             h_nonlin, _ = torch.max(self.pw[None, None, None, :, :] * (hz[:,:,:,None,None] - self.pb[None, None, None,:,None]), dim=-1)
             
             h_nonlin = h_nonlin * self.group_latent_valid_mask[None,:,:,None]
@@ -1010,13 +1101,17 @@ class CIRCA(L.LightningModule):
 
             logits += logits_z + self.b
 
-        sym_loss = self._compute_regularization_penalty(hz, hz_nonlin)
+        # sym_loss = self._compute_regularization_penalty(hz, hz_nonlin)
+
+        sym_loss = self._compute_symmetry_penalty(hz, hz_nonlin)
+
+        l1_loss = smooth_abs(self.w).sum() / (self.latent_dim * self.num_comb * 2)
 
         state_embeddings = F.normalize(torch.cat([hz_state[:,0,:], hz_state[:,1,:]], dim=0), dim=1)
 
         # hz_state[:,0,:] @ hz_state[:,1,:].T / torch.exp(self.tau)
         
-        return [logits, state_embeddings @ state_embeddings.T / torch.exp(self.tau)], batch_logits, sym_loss
+        return [logits, state_embeddings @ state_embeddings.T / torch.exp(self.tau)], batch_logits, l1_loss, sym_loss
 
     def training_step(self, train_batch, batch_idx):
         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = self._unpack_batch(train_batch)
@@ -1026,13 +1121,13 @@ class CIRCA(L.LightningModule):
             B = train_batch["x_sparse_shape"][0]
             x_in, obs_feature_groups_aug = self.sparse_augment(x_sparse, B, obs_feature_groups=obs_feature_groups, validation=False)
             projected_hz = self._project_sparse_expression(self._sparse_log1p(x_in), B, self.n_neighbors + 2)
-            logits, batch_logits, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
+            logits, batch_logits, l1_loss, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
         else:
             assert neighbors.size(1) == self.n_neighbors
             B, num_genes = cell.size()
             x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
             x_in, obs_feature_groups_aug = self.augment(x_orig, obs_feature_groups=obs_feature_groups)
-            logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
+            logits, batch_logits, l1_loss, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
 
         # -------- labels & loss --------
 
@@ -1046,6 +1141,9 @@ class CIRCA(L.LightningModule):
             ], 
             dim=0
         )
+
+        # if self.global_step < self.warmup_steps:
+        #     gcarl_labels = gcarl_labels[torch.randperm(gcarl_labels.size(0), device=gcarl_labels.device)]
         
         labels = torch.cat([B + torch.arange(B, device=logits[0].device, dtype=torch.long), torch.arange(B, device=logits[0].device, dtype=torch.long)], dim=0)
 
@@ -1069,9 +1167,9 @@ class CIRCA(L.LightningModule):
                 slide_labels = slide_id # .unsqueeze(1) # .repeat(1, batch_logits[1].shape[1])  # probably slide_id, not panel
                 adv_loss = adv_loss + self.state_criterion(batch_logits[1], slide_labels)
 
-        gcarl_loss = 0.5 * self.gcarl_criterion(logits[0][:B], gcarl_pos_labels) + 0.5 * self.gcarl_criterion(logits[0][B:], gcarl_neg_labels)
+        gcarl_loss = 0.5 * self.gcarl_criterion(logits[0][:B], gcarl_labels[:B]) + 0.5 * self.gcarl_criterion(logits[0][B:], gcarl_labels[B:])
 
-        loss = gcarl_loss + self.state_lam * state_loss + self.sym_lam * sym_loss
+        loss = gcarl_loss + self.state_lam * state_loss + self.l1_lam * compute_lambda(self.global_step, self.warmup_steps, self.trainer.estimated_stepping_batches, gamma=5) * l1_loss + self.sym_lam * sym_loss
         
         self.log('train_total_loss', loss, on_epoch=True)
 
@@ -1091,7 +1189,9 @@ class CIRCA(L.LightningModule):
 
         self.log('train_state_loss', state_loss, on_epoch=True)
 
-        self.log('train_symmetry', sym_loss, on_epoch=True)
+        self.log('train_l1', l1_loss, on_epoch=True)
+
+        self.log('train_sym', sym_loss, on_epoch=True)
 
         # self.log('train_mean', mean_loss, on_epoch=True)
         
@@ -1140,13 +1240,13 @@ class CIRCA(L.LightningModule):
             B = valid_batch["x_sparse_shape"][0]
             x_in, obs_feature_groups_aug = self.sparse_augment(x_sparse, B, obs_feature_groups=obs_feature_groups, validation=True)
             projected_hz = self._project_sparse_expression(self._sparse_log1p(x_in), B, self.n_neighbors + 2)
-            logits, batch_logits, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
+            logits, batch_logits, l1_loss, sym_loss = self(projected_hz=projected_hz, slide_id=slide_id, obs_feature_groups=obs_feature_groups_aug)
         else:
             assert neighbors.size(1) == self.n_neighbors
             B, num_genes = cell.size()
             x_orig = torch.cat([cell.unsqueeze(1), neighbors], dim=1)
             x_in, obs_feature_groups_aug = self.validation_augment(x_orig, obs_feature_groups=obs_feature_groups)
-            logits, batch_logits, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
+            logits, batch_logits, l1_loss, sym_loss = self(x_in.log1p(), slide_id, obs_feature_groups=obs_feature_groups_aug)
 
         # -------- labels & loss --------
 
@@ -1198,7 +1298,7 @@ class CIRCA(L.LightningModule):
 
         # l1_loss = smooth_abs(self.w).sum()
 
-        loss = gcarl_loss + self.state_lam * state_loss + self.sym_lam * sym_loss
+        loss = gcarl_loss + self.state_lam * state_loss + self.l1_lam * compute_lambda(self.global_step, self.warmup_steps, self.trainer.estimated_stepping_batches, gamma=5) * l1_loss + self.sym_lam * sym_loss
         
         self.log('valid_total_loss', loss, on_epoch=True)
 
@@ -1216,7 +1316,9 @@ class CIRCA(L.LightningModule):
             self.log('valid_f1', torch.tensor([f1_score(gcarl_labels.detach().reshape(-1,1).cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
             self.log('valid_mcc', torch.tensor([matthews_corrcoef(gcarl_labels.reshape(-1,1).detach().cpu().numpy(), pred.reshape(-1,1).detach().cpu().numpy())]), on_epoch=True)
 
-        self.log('valid_symmetry', sym_loss, on_epoch=True)
+        self.log('valid_l1', l1_loss, on_epoch=True)
+
+        self.log('valid_sym', sym_loss, on_epoch=True)
 
         # self.log('valid_mean', mean_loss, on_epoch=True)
         
@@ -1311,7 +1413,7 @@ class CIRCA(L.LightningModule):
             # }
 
             # # 1. Warmup: Step-based linear increase
-            warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
+            warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
             
             # 2. Plateau: Epoch-based metric monitoring
             plateau_sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1327,7 +1429,7 @@ class CIRCA(L.LightningModule):
             optimizer = torch.optim.AdamW(self.parameters(), weight_decay=self.weight_decay, lr=self.learning_rate)
 
             # # 1. Warmup: Step-based linear increase
-            warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
+            warmup_sch = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
             
             # 2. Plateau: Epoch-based metric monitoring
             plateau_sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1352,8 +1454,8 @@ class CIRCA(L.LightningModule):
         elif self.opt_algo=='adamw_final':
             optimizer = torch.optim.AdamW(self.parameters(), weight_decay=self.weight_decay, lr=self.learning_rate)
 
-            warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
-            decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.estimated_stepping_batches - self.warmup_steps, eta_min=0.001 * self.learning_rate)
+            warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_steps, last_epoch=-1)
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.estimated_stepping_batches - self.warmup_steps, eta_min=0.01 * self.learning_rate)
     
             scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, decay], milestones=[self.warmup_steps])
 

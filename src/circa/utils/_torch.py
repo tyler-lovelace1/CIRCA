@@ -170,8 +170,8 @@ def build_cell_cell_communication_masks(genes, lr_table):
         }
     }
 
-def smooth_abs(x, eps=1e-4):
-    return (x**2 + eps).sqrt() - math.sqrt(eps)
+def smooth_abs(x, delta=0.01):
+    return (x**2 + delta**2).sqrt() - delta
 
 def compute_lambda(current, start, stop, gamma=10.0):
     if current < start:

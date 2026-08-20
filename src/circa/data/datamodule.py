@@ -381,7 +381,7 @@ class SpatialNeighborhoodDataModule(L.LightningDataModule):
     ) -> DataLoader:
         if use_slide_batch_sampler:
             slide_to_dsidx = build_slide_to_dsidx(dataset, slide_key=self.slide_key)
-            print(slide_to_dsidx)
+            # print(slide_to_dsidx)
             # batch_sampler = InterleavedSlideBatchSampler(
             #     slide_to_dsidx=slide_to_dsidx,
             #     batch_size=loader_cfg.batch_size,

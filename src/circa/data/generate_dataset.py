@@ -121,6 +121,7 @@ def generate_dataset(num_group,
                           num_data=num_data,
                           ar_alpha=ar_alpha,
                           dag=dag,
+                          nonlinearity='ReLU',
                           random_seed=sampler_seed)
             elif dist_type == 'Laplace':
                 s = gen_s_lap(lam1=lam1,

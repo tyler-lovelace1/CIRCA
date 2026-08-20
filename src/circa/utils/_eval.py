@@ -6,7 +6,7 @@ import scanpy as sc
 import squidpy as sq
 from anndata import AnnData
 from scib_metrics.nearest_neighbors import NeighborsResults
-from circa.utils._utils import tqdm
+from circa.utils._utils import tqdm, _iter_uid, maxAbsScale, leiden_cluster_k
 
 def _convert_distances(matrix, n_neighbors):
     # matrix = matrix / np.median(matrix.data)

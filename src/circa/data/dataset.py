@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 from circa.data.generate_dataset import generate_dataset
 from circa.utils._torch import as_dense_array
 from sklearn.decomposition import NMF, PCA
-from sklearn.neighbors import BallTree
+from sklearn.neighbors import BallTree, KNeighborsRegressor
 
 
 @dataclass
@@ -266,7 +266,7 @@ class SpatialNeighborhoodDataset(Dataset):
         if not need_compute:
             return
 
-        print(f"ds_train slide_key is {self.slide_key}")
+        # print(f"ds_train slide_key is {self.slide_key}")
         
         # Build kwargs and ensure n_neighs is big enough when using kNN graphs
         kwargs = {"coord_type": "generic", "library_key" : self.slide_key}
@@ -579,6 +579,8 @@ class SimulatedDataset(Dataset):
         # Precompute dense neighbor arrays for top M
         self.nbr_idx, self.nbr_dist = self._precompute_topM_neighbors(D, self.M)
 
+        self.nmf_dim = min(max(self.sim_config.num_dim, 2*self.sim_config.num_dim), self.adata.shape[1]//2)
+
         self._run_nmf()
 
         for i, value in enumerate(["train", "val", "test", "pred"]):
@@ -617,13 +619,13 @@ class SimulatedDataset(Dataset):
             else:
                 self.x[:, m, :] = self.pca_models[m].transform(self.x[:, m, :])
                 
-            self.x[:, m, :] = st.norm.ppf(st.rankdata(self.x[:, m, :], axis=0, method='max') / (self.sim_config.num_data+1))
+            self.x[:, m, :] = st.norm.ppf(st.rankdata(self.x[:, m, :], axis=0) / (self.sim_config.num_data+1))
             if m == 0:
-                nmf_npn = st.norm.ppf(st.rankdata(self.adata.obsm['X_nmf'], axis=0, method='max') / (self.n_samples+1))
+                nmf_npn = st.norm.ppf(st.rankdata(self.adata.obsm['X_nmf'][:,:self.sim_config.num_dim], axis=0) / (self.n_samples+1))
                 C_nmf = np.linalg.cholesky(np.corrcoef(nmf_npn.T), upper=True)
                 self.x[:, m, :] = self.x[:, m, :] @ C_nmf
             if m == 1:
-                nmf_nbrs_npn = st.norm.ppf(st.rankdata(self.adata.obsm['X_nmf_nbrs'], axis=0, method='max') / (self.n_samples+1))
+                nmf_nbrs_npn = st.norm.ppf(st.rankdata(self.adata.obsm['X_nmf_nbrs'][:,:self.sim_config.num_dim], axis=0) / (self.n_samples+1))
                 C_nmf_nbrs = np.linalg.cholesky(np.corrcoef(nmf_nbrs_npn.T), upper=True)
                 self.x[:, m, :] = self.x[:, m, :] @ C_nmf_nbrs
 
@@ -636,11 +638,36 @@ class SimulatedDataset(Dataset):
                 elif m == 1:
                     self.x[:,m,i] = np.quantile(self.adata.obsm['X_nmf_nbrs'][:,i], x_quantiles[:,m,i], method='linear')
 
-        self.sim_counts = np.random.poisson(2 * np.expm1(self.x[:,0,:] @ self.adata.uns['X_nmf_components']))
+        x_expanded = np.zeros((self.x.shape[0], self.x.shape[1], self.nmf_dim))
+
+        # perm_idx = np.arange(self.sim_config.num_data, dtype=int)
+        # np.random.shuffle(perm_idx)
+
+        knn = KNeighborsRegressor(n_neighbors=15)
+        knn.fit(adata.obsm['X_nmf'][:,:self.sim_config.num_dim], adata.obsm['X_nmf'][:,self.sim_config.num_dim:])
+        x_expanded[:,0,:] = np.hstack([self.x[:,0,:], knn.predict(self.x[:,0,:])])
+
+        # np.random.shuffle(perm_idx)
+        knn.fit(adata.obsm['X_nmf_nbrs'][:,:self.sim_config.num_dim], adata.obsm['X_nmf_nbrs'][:,self.sim_config.num_dim:])
+        x_expanded[:,1,:] = np.hstack([self.x[:,1,:], knn.predict(self.x[:,1,:])])
+
+        sim_expected_counts = np.expm1(x_expanded[:,0,:] @ self.adata.uns['X_nmf_components'])
+        sim_total_counts = np.sum(sim_expected_counts, axis=1)
+        scale_term = max(2, np.median(self.adata.obs['total_counts']) / np.median(sim_total_counts))
+
+        print(f"Cell count scale factor: {scale_term}")
+
+        self.sim_counts = np.random.poisson(scale_term * sim_expected_counts)
         # sim_total_counts = np.sum(self.sim_counts, axis=1, keepdims=True)
         # self.sim_counts = np.random.poisson(np.median(sim_total_counts) * self.sim_counts / sim_total_counts)
 
-        self.sim_nbrs_counts = np.random.poisson(2 * np.expm1(self.x[:,1,:] @ self.adata.uns['X_nmf_nbrs_components']))
+        sim_expected_counts = np.expm1(x_expanded[:,1,:] @ self.adata.uns['X_nmf_nbrs_components'])
+        sim_total_counts = np.sum(sim_expected_counts.reshape(self.sim_config.num_data, self.sim_config.k, -1), axis=2)
+        scale_term = max(2, np.median(self.adata.obs['total_counts']) / np.median(sim_total_counts.flatten()))
+
+        print(f"Neighborhood count scale factor: {scale_term}")
+
+        self.sim_nbrs_counts = np.random.poisson(scale_term * sim_expected_counts)
         # sim_nbrs_total_counts = np.sum(self.sim_nbrs_counts, axis=1, keepdims=True)
         # self.sim_nbrs_counts = np.random.poisson(np.median(sim_nbrs_total_counts) * self.sim_nbrs_counts / sim_nbrs_total_counts)
         self.sim_nbrs_counts = self.sim_nbrs_counts.reshape(self.sim_config.num_data, self.sim_config.k, -1)
@@ -655,7 +682,6 @@ class SimulatedDataset(Dataset):
             self.sim_nbrs_counts = self.sim_nbrs_counts[:self.num_data]
         
         self.indices = np.arange(self.num_data, dtype=int)
-        
 
     def __len__(self) -> int:
         return int(self.indices.size)
@@ -669,6 +695,38 @@ class SimulatedDataset(Dataset):
         if self.x_layer not in self.adata.layers:
             raise KeyError(f"x_layer={self.x_layer!r} not found in adata.layers")
         return self.adata.layers[self.x_layer]
+
+    def _sort_nmf_factors(self, V, W, H):
+        base_reconstruction = np.dot(W, H)
+        base_error = np.linalg.norm(V - base_reconstruction, 'fro')**2
+        total_variance = np.linalg.norm(V, 'fro')**2
+
+        metrics = []
+        for k in range(self.nmf_dim):
+            # isolated component reconstruction
+            V_k = np.outer(W[:, k], H[k, :])
+            var_explained = np.linalg.norm(V_k, 'fro')**2 / total_variance
+            
+            # Reconstruction error excluding component k
+            W_minus_k = np.delete(W, k, axis=1)
+            H_minus_k = np.delete(H, k, axis=0)
+            error_without_k = np.linalg.norm(V - np.dot(W_minus_k, H_minus_k), 'fro')**2
+            error_drop = error_without_k - base_error
+            
+            metrics.append({
+                'Factor': f'Factor {k}',
+                'Index': k,
+                'Variance Explained': var_explained,
+                'Error Drop': error_drop
+            })
+        
+        # 5. Rank the results
+        df = pd.DataFrame(metrics)
+        df = df.sort_values(by='Variance Explained', ascending=False)
+
+        print(df.head(self.sim_config.num_dim).to_string(index=False))
+
+        return W[:,df['Index']], H[df['Index']]
 
     def _run_nmf(self, store_key='X_nmf'):
         """
@@ -709,7 +767,7 @@ class SimulatedDataset(Dataset):
     
         # sklearn NMF supports sparse input
         self.nmf = NMF(
-            n_components=self.sim_config.num_dim,
+            n_components=self.nmf_dim,
             init="nndsvda",
             solver="mu",
             beta_loss="frobenius",
@@ -719,6 +777,9 @@ class SimulatedDataset(Dataset):
     
         W = self.nmf.fit_transform(X)      # cells x factors
         H = self.nmf.components_           # factors x genes_used
+
+        V = X.toarray()
+        W, H = self._sort_nmf_factors(V, W, H)
     
         # Store cell loadings
         self.adata.obsm[store_key] = W.astype(np.float32)
@@ -730,7 +791,7 @@ class SimulatedDataset(Dataset):
 
         # sklearn NMF supports sparse input
         self.nbrhood_nmf = NMF(
-            n_components=self.sim_config.num_dim,
+            n_components=self.nmf_dim,
             init="nndsvda",
             solver="mu",
             beta_loss="frobenius",
@@ -740,6 +801,9 @@ class SimulatedDataset(Dataset):
     
         W_nbrs = self.nbrhood_nmf.fit_transform(as_dense_array(X)[self.nbr_idx].reshape(self.n_samples,-1))      # neighborhoods x factors
         H_nbrs = self.nbrhood_nmf.components_           # factors x genes_used
+
+        V_nbrs = as_dense_array(X)[self.nbr_idx].reshape(self.n_samples,-1)
+        W_nbrs, H_nbrs = self._sort_nmf_factors(V_nbrs, W_nbrs, H_nbrs)
     
         # Store cell loadings
         self.adata.obsm[store_key + '_nbrs'] = W_nbrs.astype(np.float32)
