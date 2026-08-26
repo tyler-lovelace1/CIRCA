@@ -276,36 +276,111 @@ def correlation_greedy(x, y, method='Pearson'):
 #         high = midpoint
 #         return leiden_cluster_k(adata, n_clusts, latent_key, low, high, n_neighbors, metric, depth=depth+1, maxDepth=maxDepth)
 
-def _get_clustering_backend(prefer_gpu=True):
-    """
-    Return (neighbors_function, leiden_function, backend_name).
+# def _get_clustering_backend(prefer_gpu=True):
+#     """
+#     Return (neighbors_function, leiden_function, backend_name).
 
-    GPU use requires:
-      1. rapids-singlecell and its RAPIDS dependencies
-      2. a CUDA device accessible through CuPy
+#     GPU use requires:
+#       1. rapids-singlecell and its RAPIDS dependencies
+#       2. a CUDA device accessible through CuPy
+#     """
+#     if prefer_gpu:
+#         # 1. Safely check if modules exist in the environment without importing them yet
+#         cupy_installed = importlib.util.find_spec("cupy") is not None
+#         rapids_installed = importlib.util.find_spec("rapids_singlecell") is not None
+
+#         if cupy_installed and rapids_installed:
+#             try:
+#                 import cupy as cp
+#                 import rapids_singlecell as rsc
+
+#                 # 2. Check for physical GPU devices
+#                 if cp.cuda.runtime.getDeviceCount() > 0:
+                    
+#                     # 3. Safely test CUDA initialization
+#                     # Wrap in a nested try/except to catch specific driver/runtime failures
+#                     try:
+#                         cp.cuda.Device().compute_capability
+#                         return rsc.pp.neighbors, rsc.tl.leiden, "rapids-singlecell"
+#                     except Exception as cuda_exc:
+#                         warnings.warn(
+#                             f"CUDA device found, but initialization failed: {cuda_exc}. "
+#                             "Falling back to Scanpy.",
+#                             RuntimeWarning,
+#                             stacklevel=2,
+#                         )
+
+#             except Exception as exc:
+#                 warnings.warn(
+#                     "GPU clustering is unavailable; falling back to Scanpy. "
+#                     f"Reason: {exc}",
+#                     RuntimeWarning,
+#                     stacklevel=2,
+#                 )
+#         else:
+#             missing = []
+#             if not cupy_installed: missing.append("cupy")
+#             if not rapids_installed: missing.append("rapids_singlecell")
+            
+#             warnings.warn(
+#                 f"GPU clustering requested but missing packages: {', '.join(missing)}. "
+#                 "Falling back to Scanpy.",
+#                 RuntimeWarning,
+#                 stacklevel=2,
+#             )
+
+#     return sc.pp.neighbors, sc.tl.leiden, "scanpy"
+
+def _get_singlecell_backend(prefer_gpu=True):
+    """
+    Select rapids-singlecell when its CUDA stack is usable; otherwise Scanpy.
     """
     if prefer_gpu:
-        try:
-            import cupy as cp
-            import rapids_singlecell as rsc
+        # 1. Check for package existence without triggering C/CUDA initialization
+        cupy_installed = importlib.util.find_spec("cupy") is not None
+        rapids_installed = importlib.util.find_spec("rapids_singlecell") is not None
 
-            if cp.cuda.runtime.getDeviceCount() > 0:
-                # Force CUDA initialization so driver/runtime problems are
-                # detected here rather than during clustering.
-                cp.cuda.Device().compute_capability
+        if cupy_installed and rapids_installed:
+            try:
+                import cupy as cp
+                import rapids_singlecell as rsc
 
-                return rsc.pp.neighbors, rsc.tl.leiden, "rapids-singlecell"
+                # 2. Check for physical GPU hardware
+                if cp.cuda.runtime.getDeviceCount() > 0:
+                    
+                    # 3. Guard the active hardware initialization
+                    try:
+                        # Select and initialize the current CUDA device.
+                        cp.cuda.Device().use()
+                        return rsc, "rapids-singlecell"
+                    except Exception as cuda_exc:
+                        warnings.warn(
+                            f"CUDA hardware found, but device initialization failed: {cuda_exc}. "
+                            "Falling back to Scanpy.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
 
-        except Exception as exc:
+            except Exception as exc:
+                warnings.warn(
+                    "rapids-singlecell is unavailable; falling back to Scanpy. "
+                    f"Reason: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            missing = []
+            if not cupy_installed: missing.append("cupy")
+            if not rapids_installed: missing.append("rapids_singlecell")
+            
             warnings.warn(
-                "GPU clustering is unavailable; falling back to Scanpy. "
-                f"Reason: {exc}",
+                f"GPU acceleration requested but missing packages: {', '.join(missing)}. "
+                "Falling back to Scanpy.",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
-    return sc.pp.neighbors, sc.tl.leiden, "scanpy"
-
+    return sc, "scanpy"
 
 def leiden_cluster_k(
     adata,
@@ -332,7 +407,8 @@ def leiden_cluster_k(
     If exactly `n_clusts` clusters are not found within `maxDepth`, the result
     from the final iteration is returned.
     """
-    neighbors_fn, leiden_fn, backend = _get_clustering_backend(prefer_gpu)
+    # Use the unified module-level backend getter
+    backend_mod, backend_name = _get_singlecell_backend(prefer_gpu)
 
     neighbors_key = f"{latent_key}_neighbors"
     n_pcs = adata.obsm[latent_key].shape[1]
@@ -346,10 +422,11 @@ def leiden_cluster_k(
             n_pcs=n_pcs,
         )
 
-        if backend == "rapids-singlecell":
+        if backend_name == "rapids-singlecell":
             neighbors_kwargs["algorithm"] = gpu_algorithm
 
-        neighbors_fn(adata, **neighbors_kwargs)
+        # Route dynamically through preprocessing submodule (.pp)
+        backend_mod.pp.neighbors(adata, **neighbors_kwargs)
 
     # Preserve support for calls that begin partway through the search.
     final_clust_key = None
@@ -367,7 +444,7 @@ def leiden_cluster_k(
                 n_iterations=3,
             )
 
-            if backend == "rapids-singlecell":
+            if backend_name == "rapids-singlecell":
                 # rapids-singlecell uses `rng`; `flavor` is not applicable.
                 leiden_kwargs["n_iterations"] = 100
                 leiden_kwargs["random_state"] = random_state
@@ -377,7 +454,8 @@ def leiden_cluster_k(
                     flavor="igraph",
                 )
 
-            leiden_fn(adata, **leiden_kwargs)
+            # Route dynamically through tools submodule (.tl)
+            backend_mod.tl.leiden(adata, **leiden_kwargs)
 
         # More robust than assuming the result is categorical.
         num_found_clusts = adata.obs[clust_key].nunique()
@@ -394,7 +472,7 @@ def leiden_cluster_k(
 
     # Record useful provenance.
     adata.uns[f"{output_key}_params"] = {
-        "backend": backend,
+        "backend": backend_name,
         "resolution": midpoint,
         "n_clusters_found": int(num_found_clusts),
         "n_clusters_requested": int(n_clusts),
@@ -404,30 +482,102 @@ def leiden_cluster_k(
 
     return output_key
 
+# def leiden_cluster_k(
+#     adata,
+#     n_clusts,
+#     latent_key,
+#     low,
+#     high,
+#     n_neighbors=15,
+#     metric="euclidean",
+#     depth=0,
+#     maxDepth=6,
+#     prefer_gpu=True,
+#     random_state=0,
+#     gpu_algorithm="brute",
+# ):
+#     """
+#     Find a Leiden resolution producing approximately `n_clusts` clusters.
 
-def _get_singlecell_backend(prefer_gpu=True):
-    """
-    Select rapids-singlecell when its CUDA stack is usable; otherwise Scanpy.
-    """
-    if prefer_gpu:
-        try:
-            import cupy as cp
-            import rapids_singlecell as rsc
+#     Uses rapids-singlecell when a working CUDA GPU is available and otherwise
+#     falls back to Scanpy.
 
-            if cp.cuda.runtime.getDeviceCount() > 0:
-                # Select and initialize the current CUDA device.
-                cp.cuda.Device().use()
-                return rsc, "rapids-singlecell"
+#     Notes
+#     -----
+#     If exactly `n_clusts` clusters are not found within `maxDepth`, the result
+#     from the final iteration is returned.
+#     """
+#     neighbors_fn, leiden_fn, backend = _get_clustering_backend(prefer_gpu)
 
-        except Exception as exc:
-            warnings.warn(
-                "rapids-singlecell is unavailable; falling back to Scanpy. "
-                f"Reason: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+#     neighbors_key = f"{latent_key}_neighbors"
+#     n_pcs = adata.obsm[latent_key].shape[1]
 
-    return sc, "scanpy"
+#     if neighbors_key not in adata.uns:
+#         neighbors_kwargs = dict(
+#             n_neighbors=n_neighbors,
+#             use_rep=latent_key,
+#             key_added=neighbors_key,
+#             metric=metric,
+#             n_pcs=n_pcs,
+#         )
+
+#         if backend == "rapids-singlecell":
+#             neighbors_kwargs["algorithm"] = gpu_algorithm
+
+#         neighbors_fn(adata, **neighbors_kwargs)
+
+#     # Preserve support for calls that begin partway through the search.
+#     final_clust_key = None
+
+#     for current_depth in range(depth, maxDepth + 1):
+#         midpoint = (high + low) / 2
+#         clust_key = f"leiden_{midpoint}_{latent_key}"
+#         final_clust_key = clust_key
+
+#         if clust_key not in adata.obs:
+#             leiden_kwargs = dict(
+#                 neighbors_key=neighbors_key,
+#                 resolution=midpoint,
+#                 key_added=clust_key,
+#                 n_iterations=3,
+#             )
+
+#             if backend == "rapids-singlecell":
+#                 # rapids-singlecell uses `rng`; `flavor` is not applicable.
+#                 leiden_kwargs["n_iterations"] = 100
+#                 leiden_kwargs["random_state"] = random_state
+#             else:
+#                 leiden_kwargs.update(
+#                     random_state=random_state,
+#                     flavor="igraph",
+#                 )
+
+#             leiden_fn(adata, **leiden_kwargs)
+
+#         # More robust than assuming the result is categorical.
+#         num_found_clusts = adata.obs[clust_key].nunique()
+
+#         if num_found_clusts == n_clusts:
+#             break
+#         elif num_found_clusts < n_clusts:
+#             low = midpoint
+#         else:
+#             high = midpoint
+
+#     output_key = f"leiden_{n_clusts}_{latent_key}"
+#     adata.obs[output_key] = adata.obs[final_clust_key].copy()
+
+#     # Record useful provenance.
+#     adata.uns[f"{output_key}_params"] = {
+#         "backend": backend,
+#         "resolution": midpoint,
+#         "n_clusters_found": int(num_found_clusts),
+#         "n_clusters_requested": int(n_clusts),
+#         "metric": metric,
+#         "n_neighbors": int(n_neighbors),
+#     }
+
+#     return output_key
 
 
 def umap_latent(
