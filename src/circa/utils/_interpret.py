@@ -410,173 +410,955 @@ def explain_gene_logits_baseline(model, datamodule, n_steps=50, internal_chunk_s
 
     return logit_attr.cpu().numpy()
 
-def explain_logits_block_baseline(model, datamodule, n_steps=50, internal_chunk_size=3200, device='cuda'):
-    model_explainer = IntegratedGradients(CIRCA_Wrapper(model).to(device))
-    
+def explain_logits_block_baseline(
+    model,
+    datamodule,
+    n_steps=50,
+    internal_chunk_size=3200,
+    device="cuda",
+    cluster_keys=None,
+):
+    """
+    Compute Integrated Gradients logit attributions using block-specific
+    zero baselines.
+
+    Parameters
+    ----------
+    model
+        Trained CIRCA model.
+    datamodule
+        Data module containing `adata` and a training dataloader.
+    n_steps
+        Number of Integrated Gradients approximation steps.
+    internal_chunk_size
+        Captum internal batch size. Must be at least the external batch size.
+    device
+        Torch device.
+    cluster_keys
+        Optional column or list of columns from `datamodule.adata.obs`.
+
+        If provided, attributions are averaged within each cluster. Multiple
+        keys define joint clusters based on observed combinations.
+
+    Returns
+    -------
+    Without cluster_keys
+        logit_attr : np.ndarray
+            Per-observation attributions with shape
+            [n_observations, total_input_dimensions].
+
+    With cluster_keys
+        logit_attr : np.ndarray
+            Mean cluster-level attributions with shape
+            [n_clusters, total_input_dimensions].
+
+        cluster_labels : list
+            Labels corresponding to the first axis of `logit_attr`. When
+            multiple cluster keys are used, labels are tuples.
+    """
+    device = torch.device(device)
+
+    model_explainer = IntegratedGradients(
+        CIRCA_Wrapper(model).to(device)
+    )
+
+    # ---------------------------------------------------------------
+    # Define input blocks
+    # ---------------------------------------------------------------
     total_extra_group_input_dims = 0
-    
-    block_bounds = [0, model.input_dim, (model.n_neighbors+1) * model.input_dim]
-    
+
+    block_bounds = [
+        0,
+        model.input_dim,
+        (model.n_neighbors + 1) * model.input_dim,
+    ]
+
     if model.extra_group_latent_dims:
-        extra_groups_explainers = {}
         for group_name in model.extra_group_names:
-            total_extra_group_input_dims += model.extra_group_input_dims[group_name]
-            block_bounds.append(block_bounds[-1] + (model.n_neighbors+1) * model.extra_group_input_dims[group_name])
-            
-    # 1. Configuration
-    latent_dimension_size = model.latent_dim
-    
-    # if reference_indices == None:
-    #     reference_indices = torch.arange(datamodule.adata.shape[0])
-    
-    num_total_samples = datamodule.adata.shape[0]
-    
+            group_input_dim = model.extra_group_input_dims[group_name]
+            total_extra_group_input_dims += group_input_dim
+
+            block_bounds.append(
+                block_bounds[-1]
+                + (model.n_neighbors + 1) * group_input_dim
+            )
+
+    total_input_dims = (
+        model.n_neighbors + 1
+    ) * (
+        model.input_dim + total_extra_group_input_dims
+    )
+
+    if block_bounds[-1] != total_input_dims:
+        raise RuntimeError(
+            "The calculated block boundaries do not match the total "
+            f"input size: {block_bounds[-1]} != {total_input_dims}."
+        )
+
+    # ---------------------------------------------------------------
+    # Construct observation-to-cluster mappings
+    # ---------------------------------------------------------------
+    aggregate_by_cluster = cluster_keys is not None
+
+    if aggregate_by_cluster:
+        if isinstance(cluster_keys, str):
+            cluster_keys = [cluster_keys]
+        else:
+            cluster_keys = list(cluster_keys)
+
+        if not cluster_keys:
+            raise ValueError("cluster_keys cannot be an empty list.")
+
+        missing_keys = [
+            key
+            for key in cluster_keys
+            if key not in datamodule.adata.obs.columns
+        ]
+
+        if missing_keys:
+            raise KeyError(
+                f"Cluster keys not found in adata.obs: {missing_keys}"
+            )
+
+        cluster_frame = datamodule.adata.obs[cluster_keys]
+        valid_cluster_mask = (
+            cluster_frame.notna().all(axis=1).to_numpy()
+        )
+
+        if len(cluster_keys) == 1:
+            valid_labels = cluster_frame.loc[
+                valid_cluster_mask,
+                cluster_keys[0],
+            ]
+
+            valid_codes, unique_labels = pd.factorize(
+                valid_labels,
+                sort=False,
+            )
+
+            cluster_labels = unique_labels.tolist()
+
+        else:
+            valid_labels = pd.MultiIndex.from_frame(
+                cluster_frame.loc[valid_cluster_mask]
+            )
+
+            valid_codes, unique_labels = pd.factorize(
+                valid_labels,
+                sort=False,
+            )
+
+            cluster_labels = unique_labels.tolist()
+
+        # Observations missing any requested annotation receive code -1
+        # and are excluded from cluster-level aggregation.
+        observation_cluster_codes = np.full(
+            datamodule.adata.n_obs,
+            -1,
+            dtype=np.int64,
+        )
+
+        observation_cluster_codes[valid_cluster_mask] = valid_codes
+
+        observation_cluster_codes = torch.as_tensor(
+            observation_cluster_codes,
+            dtype=torch.long,
+        )
+
+        n_clusters = len(cluster_labels)
+
+        logit_attr = torch.zeros(
+            (n_clusters, total_input_dims),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        cluster_counts = torch.zeros(
+            n_clusters,
+            dtype=torch.long,
+            device=device,
+        )
+
+    else:
+        num_total_samples = datamodule.adata.n_obs
+
+        logit_attr = torch.zeros(
+            (num_total_samples, total_input_dims),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    # ---------------------------------------------------------------
+    # Attribution loop
+    # ---------------------------------------------------------------
     datamodule.setup("fit")
-
-    # if not isinstance(baseline, int):
-    #     baseline = torch.as_tensor(baseline, dtype=torch.float32, device=device)
-    
-    # Container to hold final metrics
-    logit_attr = torch.zeros((num_total_samples, (model.n_neighbors + 1) * (model.input_dim + total_extra_group_input_dims)), dtype=torch.float32, device=device)
-
     dataloader = datamodule.train_dataloader()
-        
-    for idx, batch in enumerate(dataloader):
-        adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = model._unpack_batch(batch)
-    
+
+    for batch in dataloader:
+        (
+            adata_idx,
+            cell,
+            neighbors,
+            panel,
+            slide_id,
+            obs_feature_groups,
+        ) = model._unpack_batch(batch)
+
         B = len(adata_idx)
-        
-        cell_inputs = cell.to(device=device).log1p()
-        niche_inputs = neighbors.to(device=device).log1p().reshape(B,-1)
-        slide_id = slide_id.to(device=device)
-    
-        all_inputs = [cell_inputs, niche_inputs]
-    
+
+        # Keep a CPU copy for indexing precomputed observation labels.
+        batch_adata_idx_cpu = torch.as_tensor(
+            adata_idx,
+            dtype=torch.long,
+            device="cpu",
+        )
+
+        batch_adata_idx_device = batch_adata_idx_cpu.to(device)
+
+        cell_inputs = cell.to(
+            device=device,
+            dtype=torch.float32,
+        ).log1p()
+
+        niche_inputs = neighbors.to(
+            device=device,
+            dtype=torch.float32,
+        ).log1p().reshape(B, -1)
+
+        all_inputs = [
+            cell_inputs,
+            niche_inputs,
+        ]
+
         if model.extra_group_latent_dims:
-            extra_group_inputs = {}
             for group_name in model.extra_group_names:
-                extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
-                all_inputs.append(extra_group_inputs[group_name])
-    
+                group_cell = obs_feature_groups[group_name][
+                    "cell"
+                ]
+
+                group_neighbors = obs_feature_groups[group_name][
+                    "neighbors"
+                ].reshape(B, -1)
+
+                group_inputs = torch.cat(
+                    [group_cell, group_neighbors],
+                    dim=1,
+                ).to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                all_inputs.append(group_inputs)
+
         all_inputs = torch.cat(all_inputs, dim=1)
-    
-        # all_inputs_perm = [cell_inputs[random_derangement_stratified(slide_id)], niche_inputs[random_derangement_stratified(slide_id)]]
 
-        # if model.extra_group_latent_dims:
-        #     extra_group_inputs = {}
-        #     for group_name in model.extra_group_names:
-        #         extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
-        #         all_inputs_perm.append(extra_group_inputs[group_name][random_derangement_stratified(slide_id)])
-    
-        # all_inputs_perm = torch.cat(all_inputs_perm, dim=1)
+        if all_inputs.shape[1] != total_input_dims:
+            raise RuntimeError(
+                "Concatenated input dimensions do not match the "
+                f"expected size: {all_inputs.shape[1]} != "
+                f"{total_input_dims}."
+            )
 
-        for bidx in range(len(block_bounds)-1):
+        if aggregate_by_cluster:
+            batch_cluster_codes = observation_cluster_codes[
+                batch_adata_idx_cpu
+            ].to(device)
+
+            valid_cluster_mask_batch = batch_cluster_codes >= 0
+            valid_cluster_codes = batch_cluster_codes[
+                valid_cluster_mask_batch
+            ]
+
+            # Count each observation once, not once per input block.
+            if valid_cluster_codes.numel() > 0:
+                cluster_counts += torch.bincount(
+                    valid_cluster_codes,
+                    minlength=n_clusters,
+                )
+
+        # -----------------------------------------------------------
+        # Explain each input block relative to a block-zero baseline
+        # -----------------------------------------------------------
+        for block_idx in range(len(block_bounds) - 1):
+            block_start = block_bounds[block_idx]
+            block_end = block_bounds[block_idx + 1]
+
             all_inputs_block_baseline = all_inputs.clone()
-            all_inputs_block_baseline[:,block_bounds[bidx]:block_bounds[bidx+1]] = 0
-            # Compute IG for just this mini-batch
+            all_inputs_block_baseline[
+                :, block_start:block_end
+            ] = 0
+
             batch_attributions = model_explainer.attribute(
                 inputs=all_inputs,
                 baselines=all_inputs_block_baseline,
                 target=None,
                 n_steps=n_steps,
-                internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+                internal_batch_size=internal_chunk_size,
             )
-    
-            logit_attr[adata_idx.to(device=device),block_bounds[bidx]:block_bounds[bidx+1]] += batch_attributions[:,block_bounds[bidx]:block_bounds[bidx+1]]
 
-    return logit_attr.cpu().numpy()
+            block_attributions = batch_attributions[
+                :, block_start:block_end
+            ]
 
-def explain_factors(model, datamodule, n_steps=50, internal_chunk_size=3200, device='cuda'):
-    cell_explainer = IntegratedGradients(Cell_Embedding_Wrapper(model).to(device))
-    niche_explainer = IntegratedGradients(Niche_Embedding_Wrapper(model).to(device))
-    
-    total_extra_group_input_dims = 0
-   
+            if aggregate_by_cluster:
+                if valid_cluster_codes.numel() > 0:
+                    logit_attr[
+                        :, block_start:block_end
+                    ].index_add_(
+                        0,
+                        valid_cluster_codes,
+                        block_attributions[
+                            valid_cluster_mask_batch
+                        ],
+                    )
+
+            else:
+                logit_attr[
+                    batch_adata_idx_device,
+                    block_start:block_end,
+                ] += block_attributions
+
+    # ---------------------------------------------------------------
+    # Convert cluster sums into cluster means
+    # ---------------------------------------------------------------
+    if aggregate_by_cluster:
+        empty_cluster_indices = torch.where(
+            cluster_counts == 0
+        )[0]
+
+        if empty_cluster_indices.numel() > 0:
+            empty_labels = [
+                cluster_labels[i]
+                for i in empty_cluster_indices.cpu().tolist()
+            ]
+
+            raise RuntimeError(
+                "Some clusters had no observations in the training "
+                f"dataloader: {empty_labels}. This can occur if the "
+                "dataloader uses a subset sampler or drop_last=True."
+            )
+
+        logit_attr = logit_attr / cluster_counts.to(
+            dtype=logit_attr.dtype
+        ).unsqueeze(1)
+
+    logit_attr = logit_attr.detach().cpu().numpy()
+
+    if aggregate_by_cluster:
+        return logit_attr, cluster_labels
+
+    return logit_attr
+
+def explain_factors(
+    model,
+    datamodule,
+    n_steps=50,
+    internal_chunk_size=3200,
+    device="cuda",
+    cluster_keys=None,
+):
+    """
+    Compute Integrated Gradients attributions for cell, niche, and extra-group
+    latent factors.
+
+    Parameters
+    ----------
+    model
+        Trained model.
+    datamodule
+        Data module containing `adata` and a prediction dataloader.
+    n_steps
+        Number of Integrated Gradients approximation steps.
+    internal_chunk_size
+        Captum internal batch size.
+    device
+        Torch device.
+    cluster_keys
+        Optional observation column or list of columns in
+        `datamodule.adata.obs`.
+
+        If one key is given, attributions are averaged within each category.
+        If multiple keys are given, attributions are averaged within each
+        observed combination of categories.
+
+    Returns
+    -------
+    Without cluster_keys
+        cell_attr, niche_attr, extra_group_attr
+
+        This preserves the original behavior: signed and absolute
+        attributions are summed across all observations.
+
+    With cluster_keys
+        cell_attr, niche_attr, extra_group_attr, cluster_labels
+
+        Arrays have shapes:
+
+        cell_attr:
+            [n_clusters, latent_dim, 2, input_dim]
+
+        niche_attr:
+            [n_clusters, latent_dim, 2, n_neighbors * input_dim]
+
+        extra_group_attr[group_name]:
+            [
+                n_clusters,
+                extra_group_latent_dim,
+                2,
+                (n_neighbors + 1) * extra_group_input_dim,
+            ]
+
+        Axis 2 contains:
+            0: mean signed attribution
+            1: mean absolute attribution
+
+        `cluster_labels[i]` identifies cluster axis position `i`.
+    """
+    device = torch.device(device)
+
+    cell_explainer = IntegratedGradients(
+        Cell_Embedding_Wrapper(model).to(device)
+    )
+    niche_explainer = IntegratedGradients(
+        Niche_Embedding_Wrapper(model).to(device)
+    )
+
+    # ---------------------------------------------------------------
+    # Construct observation-to-cluster mappings
+    # ---------------------------------------------------------------
+    aggregate_by_cluster = cluster_keys is not None
+
+    if aggregate_by_cluster:
+        if isinstance(cluster_keys, str):
+            cluster_keys = [cluster_keys]
+        else:
+            cluster_keys = list(cluster_keys)
+
+        missing_keys = [
+            key for key in cluster_keys
+            if key not in datamodule.adata.obs.columns
+        ]
+        if missing_keys:
+            raise KeyError(
+                f"Cluster keys not found in adata.obs: {missing_keys}"
+            )
+
+        cluster_frame = datamodule.adata.obs[cluster_keys]
+        valid_cluster_mask = cluster_frame.notna().all(axis=1).to_numpy()
+
+        # Factorize only rows having complete cluster annotations.
+        if len(cluster_keys) == 1:
+            valid_labels = cluster_frame.loc[
+                valid_cluster_mask, cluster_keys[0]
+            ]
+            valid_codes, unique_labels = pd.factorize(
+                valid_labels,
+                sort=False,
+            )
+            cluster_labels = unique_labels.tolist()
+        else:
+            valid_labels = pd.MultiIndex.from_frame(
+                cluster_frame.loc[valid_cluster_mask]
+            )
+            valid_codes, unique_labels = pd.factorize(
+                valid_labels,
+                sort=False,
+            )
+            cluster_labels = unique_labels.tolist()
+
+        # -1 indicates observations excluded because at least one cluster
+        # annotation was missing.
+        observation_cluster_codes = np.full(
+            datamodule.adata.n_obs,
+            -1,
+            dtype=np.int64,
+        )
+        observation_cluster_codes[valid_cluster_mask] = valid_codes
+
+        observation_cluster_codes = torch.as_tensor(
+            observation_cluster_codes,
+            dtype=torch.long,
+        )
+
+        n_clusters = len(cluster_labels)
+        cluster_counts = torch.zeros(
+            n_clusters,
+            dtype=torch.long,
+            device=device,
+        )
+
+        leading_shape = (n_clusters,)
+    else:
+        cluster_labels = None
+        leading_shape = ()
+
+    # ---------------------------------------------------------------
+    # Extra-group explainers and baselines
+    # ---------------------------------------------------------------
+    extra_groups_explainers = {}
+    extra_groups_baselines = {}
+
     if model.extra_group_latent_dims:
-        extra_groups_explainers = {}
-        extra_groups_baselines = {}
         for group_name in model.extra_group_names:
-            total_extra_group_input_dims += model.extra_group_input_dims[group_name]
-            extra_groups_baselines[group_name] = torch.cat((model.n_neighbors+1) * [ torch.as_tensor(datamodule.adata.obs[list(datamodule.obs_feature_groups[group_name])].to_numpy().min(axis=0), dtype=torch.float32, device=device).reshape(1,-1) ], dim=1)
-            extra_groups_explainers[group_name] = IntegratedGradients(ExtraGroup_Embedding_Wrapper(model, group_name).to(device))
-    
-    # 1. Configuration
-    latent_dimension_size = model.latent_dim
-    
-    num_total_samples = datamodule.adata.shape[0]
-    
+            feature_names = list(
+                datamodule.obs_feature_groups[group_name]
+            )
+
+            minimum_values = torch.as_tensor(
+                datamodule.adata.obs[feature_names]
+                .to_numpy()
+                .min(axis=0),
+                dtype=torch.float32,
+                device=device,
+            ).reshape(1, -1)
+
+            extra_groups_baselines[group_name] = minimum_values.repeat(
+                1,
+                model.n_neighbors + 1,
+            )
+
+            extra_groups_explainers[group_name] = IntegratedGradients(
+                ExtraGroup_Embedding_Wrapper(
+                    model,
+                    group_name,
+                ).to(device)
+            )
+
+    # ---------------------------------------------------------------
+    # Allocate attribution accumulators
+    # ---------------------------------------------------------------
+    cell_attr = torch.zeros(
+        leading_shape + (
+            model.latent_dim,
+            2,
+            model.input_dim,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    niche_attr = torch.zeros(
+        leading_shape + (
+            model.latent_dim,
+            2,
+            model.n_neighbors * model.input_dim,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    extra_group_attr = {}
+
+    if model.extra_group_latent_dims:
+        for group_name in model.extra_group_names:
+            extra_group_attr[group_name] = torch.zeros(
+                leading_shape + (
+                    model.extra_group_latent_dims[group_name],
+                    2,
+                    (model.n_neighbors + 1)
+                    * model.extra_group_input_dims[group_name],
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+
+    # ---------------------------------------------------------------
+    # Helper for grouped accumulation
+    # ---------------------------------------------------------------
+    def accumulate_cluster_attributions(
+        output,
+        factor_idx,
+        batch_attributions,
+        batch_cluster_codes,
+    ):
+        """
+        Accumulate [B, F] attributions into [C, D, 2, F].
+        """
+        valid = batch_cluster_codes >= 0
+
+        if not valid.any():
+            return
+
+        valid_codes = batch_cluster_codes[valid]
+        valid_attr = batch_attributions[valid]
+
+        output[:, factor_idx, 0].index_add_(
+            0,
+            valid_codes,
+            valid_attr,
+        )
+        output[:, factor_idx, 1].index_add_(
+            0,
+            valid_codes,
+            valid_attr.abs(),
+        )
+
+    # ---------------------------------------------------------------
+    # Attribution loop
+    # ---------------------------------------------------------------
     datamodule.setup("predict")
     dataloader = datamodule.predict_dataloader()
 
-    # Container to hold final metrics
-    cell_attr = torch.zeros((model.latent_dim, 2, model.input_dim), dtype=torch.float32, device=device)
-    niche_attr = torch.zeros((model.latent_dim, 2, model.n_neighbors * model.input_dim), dtype=torch.float32, device=device)
-    
-    if model.extra_group_latent_dims:
-        extra_group_attr = {}
-        for group_name in model.extra_group_names:
-            extra_group_attr[group_name] = torch.zeros((model.extra_group_latent_dims[group_name], 2, (model.n_neighbors + 1) * model.extra_group_input_dims[group_name]), dtype=torch.float32, device=device)
-    
-    for idx, batch in enumerate(dataloader):
-        adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = model._unpack_batch(batch)
-    
+    for batch in dataloader:
+        (
+            adata_idx,
+            cell,
+            neighbors,
+            panel,
+            slide_id,
+            obs_feature_groups,
+        ) = model._unpack_batch(batch)
+
         B = len(adata_idx)
-        
-        cell_inputs = cell.to(device=device).log1p()
-        niche_inputs = neighbors.to(device=device).log1p().reshape(B,-1)
-    
+
+        cell_inputs = cell.to(
+            device=device,
+            dtype=torch.float32,
+        ).log1p()
+
+        niche_inputs = neighbors.to(
+            device=device,
+            dtype=torch.float32,
+        ).log1p().reshape(B, -1)
+
+        if aggregate_by_cluster:
+            # adata_idx indexes the original adata observation axis.
+            batch_adata_idx = torch.as_tensor(
+                adata_idx,
+                dtype=torch.long,
+                device="cpu",
+            )
+
+            batch_cluster_codes = observation_cluster_codes[
+                batch_adata_idx
+            ].to(device)
+
+            valid_codes = batch_cluster_codes[
+                batch_cluster_codes >= 0
+            ]
+
+            if valid_codes.numel() > 0:
+                cluster_counts += torch.bincount(
+                    valid_codes,
+                    minlength=n_clusters,
+                )
+
+        extra_group_inputs = {}
+
         if model.extra_group_latent_dims:
-            extra_group_inputs = {}
             for group_name in model.extra_group_names:
-                extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
-        
+                extra_group_inputs[group_name] = torch.cat(
+                    [
+                        obs_feature_groups[group_name]["cell"],
+                        obs_feature_groups[group_name]["neighbors"].reshape(
+                            B,
+                            -1,
+                        ),
+                    ],
+                    dim=1,
+                ).to(
+                    device=device,
+                    dtype=torch.float32,
+                )
+
         for dim_idx in range(model.latent_dim):
             batch_cell_attributions = cell_explainer.attribute(
                 inputs=cell_inputs,
                 baselines=0,
                 target=None,
-                additional_forward_args=(dim_idx),
+                additional_forward_args=dim_idx,
                 n_steps=n_steps,
-                internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+                internal_batch_size=internal_chunk_size,
             )
-    
-            cell_attr[dim_idx,0] += batch_cell_attributions.sum(dim=0)
-            cell_attr[dim_idx,1] += batch_cell_attributions.abs().sum(dim=0)
-    
+
             batch_niche_attributions = niche_explainer.attribute(
                 inputs=niche_inputs,
                 baselines=0,
                 target=None,
-                additional_forward_args=(dim_idx),
+                additional_forward_args=dim_idx,
                 n_steps=n_steps,
-                internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+                internal_batch_size=internal_chunk_size,
             )
-    
-            niche_attr[dim_idx,0] += batch_niche_attributions.sum(dim=0)
-            niche_attr[dim_idx,1] += batch_niche_attributions.abs().sum(dim=0)
-    
+
+            if aggregate_by_cluster:
+                accumulate_cluster_attributions(
+                    cell_attr,
+                    dim_idx,
+                    batch_cell_attributions,
+                    batch_cluster_codes,
+                )
+                accumulate_cluster_attributions(
+                    niche_attr,
+                    dim_idx,
+                    batch_niche_attributions,
+                    batch_cluster_codes,
+                )
+            else:
+                cell_attr[dim_idx, 0] += (
+                    batch_cell_attributions.sum(dim=0)
+                )
+                cell_attr[dim_idx, 1] += (
+                    batch_cell_attributions.abs().sum(dim=0)
+                )
+
+                niche_attr[dim_idx, 0] += (
+                    batch_niche_attributions.sum(dim=0)
+                )
+                niche_attr[dim_idx, 1] += (
+                    batch_niche_attributions.abs().sum(dim=0)
+                )
+
             if model.extra_group_latent_dims:
                 for group_name in model.extra_group_names:
-                    if dim_idx < model.extra_group_latent_dims[group_name]:
-                        batch_extra_group_attributions = extra_groups_explainers[group_name].attribute(
+                    if (
+                        dim_idx
+                        >= model.extra_group_latent_dims[group_name]
+                    ):
+                        continue
+
+                    batch_extra_attributions = (
+                        extra_groups_explainers[group_name].attribute(
                             inputs=extra_group_inputs[group_name],
                             baselines=extra_groups_baselines[group_name],
                             target=None,
-                            additional_forward_args=(dim_idx),
+                            additional_forward_args=dim_idx,
                             n_steps=n_steps,
-                            internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+                            internal_batch_size=internal_chunk_size,
                         )
-            
-                        extra_group_attr[group_name][dim_idx,0] += batch_extra_group_attributions.sum(dim=0)
-                        extra_group_attr[group_name][dim_idx,1] += batch_extra_group_attributions.abs().sum(dim=0)
+                    )
 
-    if model.extra_group_latent_dims:
-        for group_name in model.extra_group_names:
-            extra_group_attr[group_name] = extra_group_attr[group_name].cpu().numpy()
+                    if aggregate_by_cluster:
+                        accumulate_cluster_attributions(
+                            extra_group_attr[group_name],
+                            dim_idx,
+                            batch_extra_attributions,
+                            batch_cluster_codes,
+                        )
+                    else:
+                        extra_group_attr[group_name][
+                            dim_idx, 0
+                        ] += batch_extra_attributions.sum(dim=0)
+
+                        extra_group_attr[group_name][
+                            dim_idx, 1
+                        ] += batch_extra_attributions.abs().sum(dim=0)
+
+    # ---------------------------------------------------------------
+    # Convert cluster sums to means
+    # ---------------------------------------------------------------
+    if aggregate_by_cluster:
+        if torch.any(cluster_counts == 0):
+            empty_indices = (
+                torch.where(cluster_counts == 0)[0].cpu().tolist()
+            )
+            empty_labels = [
+                cluster_labels[i] for i in empty_indices
+            ]
+            raise RuntimeError(
+                "Some clusters had no observations in the prediction "
+                f"dataloader: {empty_labels}"
+            )
+
+        denominator = cluster_counts.to(
+            dtype=torch.float32
+        ).reshape(n_clusters, 1, 1, 1)
+
+        cell_attr = cell_attr / denominator
+        niche_attr = niche_attr / denominator
+
+        for group_name in extra_group_attr:
+            extra_group_attr[group_name] = (
+                extra_group_attr[group_name] / denominator
+            )
+
+    # ---------------------------------------------------------------
+    # Move final outputs to CPU
+    # ---------------------------------------------------------------
+    cell_attr = cell_attr.detach().cpu().numpy()
+    niche_attr = niche_attr.detach().cpu().numpy()
+
+    extra_group_attr = {
+        group_name: values.detach().cpu().numpy()
+        for group_name, values in extra_group_attr.items()
+    }
+
+    if aggregate_by_cluster:
+        return (
+            cell_attr,
+            niche_attr,
+            extra_group_attr,
+            cluster_labels,
+        )
+
+    return cell_attr, niche_attr, extra_group_attr
+
+# def explain_logits_block_baseline(model, datamodule, n_steps=50, internal_chunk_size=3200, device='cuda'):
+#     model_explainer = IntegratedGradients(CIRCA_Wrapper(model).to(device))
+    
+#     total_extra_group_input_dims = 0
+    
+#     block_bounds = [0, model.input_dim, (model.n_neighbors+1) * model.input_dim]
+    
+#     if model.extra_group_latent_dims:
+#         extra_groups_explainers = {}
+#         for group_name in model.extra_group_names:
+#             total_extra_group_input_dims += model.extra_group_input_dims[group_name]
+#             block_bounds.append(block_bounds[-1] + (model.n_neighbors+1) * model.extra_group_input_dims[group_name])
             
-        return cell_attr.cpu().numpy(), niche_attr.cpu().numpy(), extra_group_attr
-    else:
-        return cell_attr.cpu().numpy(), niche_attr.cpu().numpy(), {}
+#     # 1. Configuration
+#     latent_dimension_size = model.latent_dim
+    
+#     # if reference_indices == None:
+#     #     reference_indices = torch.arange(datamodule.adata.shape[0])
+    
+#     num_total_samples = datamodule.adata.shape[0]
+    
+#     datamodule.setup("fit")
+
+#     # if not isinstance(baseline, int):
+#     #     baseline = torch.as_tensor(baseline, dtype=torch.float32, device=device)
+    
+#     # Container to hold final metrics
+#     logit_attr = torch.zeros((num_total_samples, (model.n_neighbors + 1) * (model.input_dim + total_extra_group_input_dims)), dtype=torch.float32, device=device)
+
+#     dataloader = datamodule.train_dataloader()
+        
+#     for idx, batch in enumerate(dataloader):
+#         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = model._unpack_batch(batch)
+    
+#         B = len(adata_idx)
+        
+#         cell_inputs = cell.to(device=device).log1p()
+#         niche_inputs = neighbors.to(device=device).log1p().reshape(B,-1)
+#         slide_id = slide_id.to(device=device)
+    
+#         all_inputs = [cell_inputs, niche_inputs]
+    
+#         if model.extra_group_latent_dims:
+#             extra_group_inputs = {}
+#             for group_name in model.extra_group_names:
+#                 extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
+#                 all_inputs.append(extra_group_inputs[group_name])
+    
+#         all_inputs = torch.cat(all_inputs, dim=1)
+    
+#         # all_inputs_perm = [cell_inputs[random_derangement_stratified(slide_id)], niche_inputs[random_derangement_stratified(slide_id)]]
+
+#         # if model.extra_group_latent_dims:
+#         #     extra_group_inputs = {}
+#         #     for group_name in model.extra_group_names:
+#         #         extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
+#         #         all_inputs_perm.append(extra_group_inputs[group_name][random_derangement_stratified(slide_id)])
+    
+#         # all_inputs_perm = torch.cat(all_inputs_perm, dim=1)
+
+#         for bidx in range(len(block_bounds)-1):
+#             all_inputs_block_baseline = all_inputs.clone()
+#             all_inputs_block_baseline[:,block_bounds[bidx]:block_bounds[bidx+1]] = 0
+#             # Compute IG for just this mini-batch
+#             batch_attributions = model_explainer.attribute(
+#                 inputs=all_inputs,
+#                 baselines=all_inputs_block_baseline,
+#                 target=None,
+#                 n_steps=n_steps,
+#                 internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+#             )
+    
+#             logit_attr[adata_idx.to(device=device),block_bounds[bidx]:block_bounds[bidx+1]] += batch_attributions[:,block_bounds[bidx]:block_bounds[bidx+1]]
+
+#     return logit_attr.cpu().numpy()
+
+# def explain_factors(model, datamodule, n_steps=50, internal_chunk_size=3200, device='cuda'):
+#     cell_explainer = IntegratedGradients(Cell_Embedding_Wrapper(model).to(device))
+#     niche_explainer = IntegratedGradients(Niche_Embedding_Wrapper(model).to(device))
+    
+#     total_extra_group_input_dims = 0
+   
+#     if model.extra_group_latent_dims:
+#         extra_groups_explainers = {}
+#         extra_groups_baselines = {}
+#         for group_name in model.extra_group_names:
+#             total_extra_group_input_dims += model.extra_group_input_dims[group_name]
+#             extra_groups_baselines[group_name] = torch.cat((model.n_neighbors+1) * [ torch.as_tensor(datamodule.adata.obs[list(datamodule.obs_feature_groups[group_name])].to_numpy().min(axis=0), dtype=torch.float32, device=device).reshape(1,-1) ], dim=1)
+#             extra_groups_explainers[group_name] = IntegratedGradients(ExtraGroup_Embedding_Wrapper(model, group_name).to(device))
+    
+#     # 1. Configuration
+#     latent_dimension_size = model.latent_dim
+    
+#     num_total_samples = datamodule.adata.shape[0]
+    
+#     datamodule.setup("predict")
+#     dataloader = datamodule.predict_dataloader()
+
+#     # Container to hold final metrics
+#     cell_attr = torch.zeros((model.latent_dim, 2, model.input_dim), dtype=torch.float32, device=device)
+#     niche_attr = torch.zeros((model.latent_dim, 2, model.n_neighbors * model.input_dim), dtype=torch.float32, device=device)
+    
+#     if model.extra_group_latent_dims:
+#         extra_group_attr = {}
+#         for group_name in model.extra_group_names:
+#             extra_group_attr[group_name] = torch.zeros((model.extra_group_latent_dims[group_name], 2, (model.n_neighbors + 1) * model.extra_group_input_dims[group_name]), dtype=torch.float32, device=device)
+    
+#     for idx, batch in enumerate(dataloader):
+#         adata_idx, cell, neighbors, panel, slide_id, obs_feature_groups = model._unpack_batch(batch)
+    
+#         B = len(adata_idx)
+        
+#         cell_inputs = cell.to(device=device).log1p()
+#         niche_inputs = neighbors.to(device=device).log1p().reshape(B,-1)
+    
+#         if model.extra_group_latent_dims:
+#             extra_group_inputs = {}
+#             for group_name in model.extra_group_names:
+#                 extra_group_inputs[group_name] = torch.cat([obs_feature_groups[group_name]['cell'], obs_feature_groups[group_name]['neighbors'].reshape(B,-1)], dim=1).to(device=device)
+        
+#         for dim_idx in range(model.latent_dim):
+#             batch_cell_attributions = cell_explainer.attribute(
+#                 inputs=cell_inputs,
+#                 baselines=0,
+#                 target=None,
+#                 additional_forward_args=(dim_idx),
+#                 n_steps=n_steps,
+#                 internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+#             )
+    
+#             cell_attr[dim_idx,0] += batch_cell_attributions.sum(dim=0)
+#             cell_attr[dim_idx,1] += batch_cell_attributions.abs().sum(dim=0)
+    
+#             batch_niche_attributions = niche_explainer.attribute(
+#                 inputs=niche_inputs,
+#                 baselines=0,
+#                 target=None,
+#                 additional_forward_args=(dim_idx),
+#                 n_steps=n_steps,
+#                 internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+#             )
+    
+#             niche_attr[dim_idx,0] += batch_niche_attributions.sum(dim=0)
+#             niche_attr[dim_idx,1] += batch_niche_attributions.abs().sum(dim=0)
+    
+#             if model.extra_group_latent_dims:
+#                 for group_name in model.extra_group_names:
+#                     if dim_idx < model.extra_group_latent_dims[group_name]:
+#                         batch_extra_group_attributions = extra_groups_explainers[group_name].attribute(
+#                             inputs=extra_group_inputs[group_name],
+#                             baselines=extra_groups_baselines[group_name],
+#                             target=None,
+#                             additional_forward_args=(dim_idx),
+#                             n_steps=n_steps,
+#                             internal_batch_size=internal_chunk_size # Must be >= external_batch_size
+#                         )
+            
+#                         extra_group_attr[group_name][dim_idx,0] += batch_extra_group_attributions.sum(dim=0)
+#                         extra_group_attr[group_name][dim_idx,1] += batch_extra_group_attributions.abs().sum(dim=0)
+
+#     if model.extra_group_latent_dims:
+#         for group_name in model.extra_group_names:
+#             extra_group_attr[group_name] = extra_group_attr[group_name].cpu().numpy()
+            
+#         return cell_attr.cpu().numpy(), niche_attr.cpu().numpy(), extra_group_attr
+#     else:
+#         return cell_attr.cpu().numpy(), niche_attr.cpu().numpy(), {}
 
 def spatial_features_annotate(attr, genes, n_neighbors, obs_names, amyloid_feats, genesets=None, n_contact_neighbors=5, signed=True):
 

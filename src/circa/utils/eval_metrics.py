@@ -8,7 +8,7 @@ import scipy.sparse as sp
 import pandas as pd
 from scib_metrics import metrics as scib
 from circa.utils._utils import _iter_uid, leiden_cluster_k, maxAbsScale, tqdm
-from circa.utils._eval import _get_scib_neighbors_result, _prepare_adatas_for_evaluation
+from circa.utils._eval import _get_scib_neighbors_result, _prepare_adatas_for_evaluation, stratified_knn_cv, stratified_lr_cv
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def evaluate_all_metrics(adata, representations, label_key, slide_key, levels, d
                     ## Batch correction across slides
                     'kBET' : kbet_score(adata, latent_key=latent_key, slide_key=slide_key, n_neighbors=n_neighbors), 
                     'ILISI' : ilisi_score(adata, latent_key=latent_key, slide_key=slide_key, n_neighbors=n_neighbors),
-                    'JSD' : mean_normalized_jensen_shannon_divergence(adataList, latent_key=latent_key, levels=levels, slide_key=slide_key)
+                    'JSD' : 1 - mean_normalized_jensen_shannon_divergence(adataList, latent_key=latent_key, levels=levels, slide_key=slide_key)
                 },
                 index = [latent_key]
             )
@@ -90,6 +90,7 @@ def evaluate_fast_metrics(adata, representations, label_key, slide_key, levels, 
     metricsList = []
     idx = 0
     for latent_key, dist_metric in tqdm(zip(representations, dist_metrics), desc='Computing metrics...'):
+
         if len(adata.obs[slide_key].cat.categories) > 1:
             single = pd.DataFrame(
                 {
@@ -97,6 +98,7 @@ def evaluate_fast_metrics(adata, representations, label_key, slide_key, levels, 
                     ## Similarity to celltype labels
                     'ARI' : max_adjusted_rand_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
                     'AMI' : max_adjusted_mutual_info_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
+                    'NMI' : max_normalized_mutual_info_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
                     'CLISI' : clisi_score(adata, latent_key=latent_key, label_key=label_key, n_neighbors=n_neighbors),
                     ## Embedding continuity compared to spatial organization
                     'FIDE' : mean_mean_fide_score(adataList, latent_key=latent_key, levels=levels, slide_key=slide_key),
@@ -117,12 +119,68 @@ def evaluate_fast_metrics(adata, representations, label_key, slide_key, levels, 
                     ## Similarity to celltype labels
                     'ARI' : max_adjusted_rand_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
                     'AMI' : max_adjusted_mutual_info_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
+                    'NMI' : max_normalized_mutual_info_score(adata, latent_key=latent_key, levels=levels, label_key=label_key),
                     'CLISI' : clisi_score(adata, latent_key=latent_key, label_key=label_key, n_neighbors=n_neighbors),
                     ## Embedding continuity compared to spatial organization
                     'FIDE' : mean_mean_fide_score(adataList, latent_key=latent_key, levels=levels, slide_key=slide_key),
                     'MLAMI' : mean_mlami_score(adataList, latent_key=latent_key, levels=levels, spatial_key=spatial_key),
                     'GCS' : mean_gcs_score(adataList, latent_key=latent_key, n_neighbors=n_neighbors, spatial_key=spatial_key),
                     'CLISIS' : clisis_score(adata, latent_key=latent_key, label_key=label_key, slide_key=slide_key, spatial_key=spatial_key, n_neighbors=n_neighbors)
+                },
+                index = [latent_key]
+            )
+        
+        metricsList.append(single)
+        idx +=1
+
+    return pd.concat(metricsList)
+
+def evaluate_classification_metrics(adata, representations, label_key, slide_key, levels, dist_metric='euclidean', spatial_key='spatial', n_neighbors=15):
+    # adata, adataList = _prepare_adatas_for_evaluation(adata, slide_key=slide_key, levels=levels, spatial_key=spatial_key, n_neighbors=n_neighbors)
+    
+    if isinstance(dist_metric, str):
+        dist_metrics = len(representations) * [dist_metric]
+    else:
+        dist_metrics = dist_metric
+
+    assert len(dist_metrics) == len(representations)
+
+    metricsList = []
+    idx = 0
+    for latent_key, dist_metric in tqdm(zip(representations, dist_metrics), desc='Computing metrics...'):
+        
+        knn_label_res = stratified_knn_cv(adata.obsm[latent_key].copy(), adata.obs[label_key].copy(), adata.obs[slide_key].copy(), random_state=42, n_neighbors=n_neighbors, metric=dist_metric)
+        lr_label_res = stratified_lr_cv(adata.obsm[latent_key].copy(), adata.obs[label_key].copy(), adata.obs[slide_key].copy(), random_state=42, metric=dist_metric)
+        
+        if len(adata.obs[slide_key].cat.categories) > 1:
+            knn_batch_res = stratified_knn_cv(adata.obsm[latent_key].copy(), adata.obs[slide_key].copy(), adata.obs[slide_key].copy(), random_state=42, n_neighbors=n_neighbors, metric=dist_metric)
+            lr_batch_res = stratified_lr_cv(adata.obsm[latent_key].copy(), adata.obs[slide_key].copy(), adata.obs[slide_key].copy(), random_state=42, metric=dist_metric)
+            
+            single = pd.DataFrame(
+                {
+                    'Representation' : latent_key,
+                    ## Similarity to celltype labels
+                    'kNN Accuracy' : np.mean(knn_label_res['accuracy']),
+                    'kNN Macro F1' : np.mean(knn_label_res['macro_f1']),
+                    'Linear Accuracy' : np.mean(lr_label_res['accuracy']),
+                    'Linear Macro F1' : np.mean(lr_label_res['macro_f1']),
+                    ## Batch correction across slides
+                    '1 - Batch kNN Accuracy' : np.mean(knn_batch_res['accuracy']),
+                    '1 - Batch kNN Macro F1' : np.mean(knn_batch_res['macro_f1']),
+                    '1 - Batch Linear Accuracy' : np.mean(lr_batch_res['accuracy']),
+                    '1 - Batch Linear Macro F1' : np.mean(lr_batch_res['macro_f1']),
+                },
+                index = [latent_key]
+            )
+        else:
+            single = pd.DataFrame(
+                {
+                    'Representation' : latent_key,
+                    ## Similarity to celltype labels
+                    'kNN Accuracy' : np.mean(knn_label_res['accuracy']),
+                    'kNN Macro F1' : np.mean(knn_label_res['macro_f1']),
+                    'Linear Accuracy' : np.mean(lr_label_res['accuracy']),
+                    'Linear Macro F1' : np.mean(lr_label_res['macro_f1']),
                 },
                 index = [latent_key]
             )
@@ -258,6 +316,15 @@ def max_adjusted_mutual_info_score(adata, latent_key, levels, label_key):
             best_k = k
     return mami
 
+def max_normalized_mutual_info_score(adata, latent_key, levels, label_key):
+    mnmi = 0
+    for k in levels:
+        nmi = metrics.normalized_mutual_info_score(adata.obs[label_key], adata.obs[f'leiden_{k}_{latent_key}'])
+        if nmi > mnmi:
+            mnmi = nmi
+            best_k = k
+    return mnmi
+
 def mean_silhouette_score(adata, latent_key, levels, metric='euclidean'):
     scores = []
     for k in levels:
@@ -284,7 +351,11 @@ def mean_mean_fide_score(
         if isinstance(adatas, AnnData):
             n_classes = len(adatas.obs[clust_key].cat.categories)
         else:
-            n_classes = len(adatas[0].obs[clust_key].cat.categories)
+            clust_labels = []
+            for adata in adatas:
+                clust_labels.append(adata.obs[clust_key].cat.categories)
+            clust_labels = np.concatenate(clust_labels, axis=0)
+            n_classes = len(np.unique(clust_labels))
         scores.append(mean_fide_score(adatas, obs_key=clust_key, slide_key=slide_key, n_classes=n_classes))
         
     return float(np.mean(scores))

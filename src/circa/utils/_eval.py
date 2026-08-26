@@ -7,6 +7,91 @@ import squidpy as sq
 from anndata import AnnData
 from scib_metrics.nearest_neighbors import NeighborsResults
 from circa.utils._utils import tqdm, _iter_uid, maxAbsScale, leiden_cluster_k
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+
+def stratified_knn_cv(X, y, stratify_by, random_state=42, n_neighbors=15, metric='euclidean'):
+    """
+    Performs 5-fold KNN classification stratified by a custom input vector
+    and returns both accuracy and macro F1 scores for each fold.
+    
+    Parameters:
+    X (array-like): Feature matrix.
+    y (array-like): Target labels for classification.
+    stratify_by (array-like): The vector used to control the stratified split.
+    random_state (int): Seed for reproducibility.
+    n_neighbors (int): Number of neighbors for KNN.
+    
+    Returns:
+    dict: Lists of 'accuracy' and 'macro_f1' scores for each of the 5 folds.
+    """
+    # Initialize StratifiedKFold using the custom stratification vector
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    
+    # Initialize the KNN classifier
+    knn = KNeighborsClassifier(n_neighbors=n_neighbors, metric=metric)
+    
+    # Generate splits based on the custom stratify_by vector
+    splits = cv.split(X, stratify_by)
+    
+    # Define the multiple evaluation metrics
+    scoring = {
+        'accuracy': 'accuracy',
+        'macro_f1': 'f1_macro'
+    }
+    
+    # Evaluate the model using cross_validate
+    results = cross_validate(knn, X, y, cv=splits, scoring=scoring)
+    
+    # Format and return the specific scores
+    return {
+        'accuracy': results['test_accuracy'].tolist(),
+        'macro_f1': results['test_macro_f1'].tolist()
+    }
+
+def stratified_lr_cv(X, y, stratify_by, random_state=42, max_iter=1000, metric='euclidean'):
+    """
+    Performs 5-fold Logistic Regression classification stratified by a custom input vector
+    and returns both accuracy and macro F1 scores for each fold.
+    
+    Parameters:
+    X (array-like): Feature matrix.
+    y (array-like): Target labels for classification.
+    stratify_by (array-like): The vector used to control the stratified split.
+    random_state (int): Seed for reproducibility.
+    max_iter (int): Maximum number of iterations for the solver to converge.
+    
+    Returns:
+    dict: Lists of 'accuracy' and 'macro_f1' scores for each of the 5 folds.
+    """
+
+    if metric == 'cosine':
+        X = X / np.linalg.norm(X, axis=1, keepdims=True)
+    
+    # Initialize StratifiedKFold using the custom stratification vector
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    
+    # Initialize Logistic Regression with the random state for reproducibility
+    lr = LogisticRegression(random_state=random_state, max_iter=max_iter)
+    
+    # Generate splits based on the custom stratify_by vector
+    splits = cv.split(X, stratify_by)
+    
+    # Define the multiple evaluation metrics
+    scoring = {
+        'accuracy': 'accuracy',
+        'macro_f1': 'f1_macro'
+    }
+    
+    # Evaluate the model using cross_validate
+    results = cross_validate(lr, X, y, cv=splits, scoring=scoring)
+    
+    # Format and return the specific scores
+    return {
+        'accuracy': results['test_accuracy'].tolist(),
+        'macro_f1': results['test_macro_f1'].tolist()
+    }
 
 def _convert_distances(matrix, n_neighbors):
     # matrix = matrix / np.median(matrix.data)
