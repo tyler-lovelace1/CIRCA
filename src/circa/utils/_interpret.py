@@ -10,7 +10,7 @@ from scipy import sparse
 from anndata import AnnData
 
 from captum.attr import IntegratedGradients
-from circa.model.CIRCA import CIRCA, CIRCA_Wrapper, Cell_Embedding_Wrapper, Niche_Embedding_Wrapper, ExtraGroup_Embedding_Wrapper
+from circa.model.CIRCA import CIRCAModel, CIRCA_Wrapper, Cell_Embedding_Wrapper, Niche_Embedding_Wrapper, ExtraGroup_Embedding_Wrapper
 from circa.utils._torch import random_derangement_stratified
 
 def compute_integrated_gradients(model, datamodule, baseline=0, n_neighbors_contact=5, n_steps=50, internal_chunk_size=6400, device='cuda', reference_indices=None):
@@ -425,7 +425,7 @@ def explain_logits_block_baseline(
     Parameters
     ----------
     model
-        Trained CIRCA model.
+        Trained CIRCAModel.
     datamodule
         Data module containing `adata` and a training dataloader.
     n_steps

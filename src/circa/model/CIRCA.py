@@ -18,7 +18,7 @@ from circa.utils._torch import (
 )
 
 
-class CIRCA(L.LightningModule):
+class CIRCAModel(L.LightningModule):
     def __init__(self, hparams):
         super().__init__()
         self.input_dim = hparams['input_dim']
@@ -1549,3 +1549,7 @@ class ExtraGroup_Embedding_Wrapper(nn.Module):
         
         # Return only the specific latent dimension scalar for the batch
         return embeddings[:, latent_dim_idx]
+
+
+# Compatibility for existing low-level imports and serialized class references.
+CIRCA = CIRCAModel
